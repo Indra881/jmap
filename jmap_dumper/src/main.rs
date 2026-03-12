@@ -33,6 +33,10 @@ struct Cli {
     #[arg(long)]
     names: bool,
 
+    /// Print struct layouts before dumping
+    #[arg(long, short = 'v')]
+    verbose: bool,
+
     /// Output dump .jmap path
     #[arg(index = 1)]
     output: PathBuf,
@@ -65,6 +69,7 @@ fn main() -> Result<()> {
     let options = DumpOptions {
         all: cli.all,
         names: cli.names,
+        verbose: cli.verbose,
     };
 
     let reflection_data: Jmap = if let Some(path) = cli.jmap {

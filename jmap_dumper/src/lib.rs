@@ -217,6 +217,8 @@ pub struct DumpOptions {
     pub all: bool,
     /// Dump FName table
     pub names: bool,
+    /// Print struct layouts before dumping
+    pub verbose: bool,
 }
 
 pub fn dump(input: Input, struct_info: Option<Structs>, options: DumpOptions) -> Result<Jmap> {
@@ -227,14 +229,16 @@ pub fn dump(input: Input, struct_info: Option<Structs>, options: DumpOptions) ->
             let handle: ProcessHandle = ProcessHandle::new(pid);
             let mem = MemCache::wrap(handle);
             let image = patternsleuth::process::external::read_image_from_pid(pid)?;
-            dump_inner(mem, &image, struct_info, &source_name, options)
+            let ctx = connect(mem, &image, struct_info, options.verbose)?;
+            dump_inner(ctx, &source_name, options)
         }
         Input::Dump(path) => {
             let source_name = path.file_name().unwrap_or_default().to_string_lossy();
 
             let dump = open_minidump(&path)?;
             let mem = MinidumpMem::new(dump.minidump)?;
-            dump_inner(mem, &dump.image, struct_info, &source_name, options)
+            let ctx = connect(mem, &dump.image, struct_info, options.verbose)?;
+            dump_inner(ctx, &source_name, options)
         }
     }
 }
@@ -255,23 +259,37 @@ mod script_containers {
     }
 }
 
+fn print_struct_layouts(structs: &Structs) {
+    eprintln!("=== Struct Layouts ===");
+    for info in &structs.0 {
+        eprintln!(
+            "{} size=0x{:x} align=0x{:x}",
+            info.name, info.size, info.alignment
+        );
+        for member in &info.members {
+            eprintln!("  0x{:<4x} {}", member.offset, member.name);
+        }
+    }
+}
+
 pub fn connect_pid(pid: i32, struct_info: Option<Structs>) -> Result<Ctx> {
     let handle: ProcessHandle = ProcessHandle::new(pid);
     let mem = MemCache::wrap(handle);
     let image = patternsleuth::process::external::read_image_from_pid(pid)?;
-    connect(mem, &image, struct_info)
+    connect(mem, &image, struct_info, false)
 }
 
 pub fn connect_pid_live(pid: i32, struct_info: Option<Structs>) -> Result<Ctx> {
     let handle: ProcessHandle = ProcessHandle::new(pid);
     let image = patternsleuth::process::external::read_image_from_pid(pid)?;
-    connect(handle, &image, struct_info)
+    connect(handle, &image, struct_info, false)
 }
 
 pub fn connect(
     mem: impl mem::Mem + 'static,
     image: &Image<'_>,
     struct_info: Option<Structs>,
+    verbose: bool,
 ) -> Result<Ctx> {
     let results = resolve(image, Resolution::resolver())?;
     println!("{results:X?}");
@@ -329,6 +347,10 @@ pub fn connect(
                 )
             })?
     };
+
+    if verbose {
+        print_struct_layouts(&struct_info);
+    }
 
     Ok(Ctx::new(mem::CtxInner {
         mem: Box::new(mem),
@@ -391,15 +413,7 @@ fn has_canonical_cdo(class_path: &str, obj: &ObjectType) -> bool {
     c.class_default_object.as_deref() == Some(expected.as_str())
 }
 
-fn dump_inner(
-    mem: impl mem::Mem + 'static,
-    image: &Image<'_>,
-    struct_info: Option<Structs>,
-    source_name: &str,
-    options: DumpOptions,
-) -> Result<Jmap> {
-    let mem = connect(mem, image, struct_info)?;
-
+fn dump_inner(mem: Ctx, source_name: &str, options: DumpOptions) -> Result<Jmap> {
     let uobjectarray = Ptr::<FUObjectArray>::new(mem.uobjectarray, mem.clone())?;
 
     let mut objects = BTreeMap::<String, ObjectType>::default();
