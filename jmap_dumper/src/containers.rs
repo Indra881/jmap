@@ -139,6 +139,16 @@ impl Ptr<FName> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct FNameEntryAllocator;
+impl Ptr<FNameEntryAllocator> {
+    pub fn blocks(&self) -> Ptr<Ptr<u8>> {
+        let offset = self.ctx().struct_member("FNameEntryAllocator", "Blocks");
+        self.byte_offset(offset).cast()
+    }
+}
+
 pub fn resolve_fname(ctx: &Ctx, comparison_index: u32, number: u32) -> Result<String> {
     let fnamepool = ctx.fnamepool;
     let case_preserving = ctx.case_preserving;
@@ -188,7 +198,8 @@ pub fn resolve_fname(ctx: &Ctx, comparison_index: u32, number: u32) -> Result<St
         });
     }
 
-    let blocks = Ptr::<Ptr<u8>>::new(fnamepool + 0x10, ctx.clone())?;
+    let entries = Ptr::<FNameEntryAllocator>::new(fnamepool, ctx.clone())?;
+    let blocks = entries.blocks();
 
     let block_index = (comparison_index >> 16) as usize;
     let offset = if case_preserving {

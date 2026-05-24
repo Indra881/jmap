@@ -1,4 +1,5 @@
 ﻿import unreal::core::{UE_VERSION, WITH_CASE_PRESERVING_NAME, int8_t, uint8_t, int16_t, uint16_t, int32_t, uint32_t, int64_t, uint64_t};
+import unreal::sys::{os, OS_WIN32, OS_DARWIN};
 import unreal::containers::{FScriptElement, TSizedHeapAllocator, TArray, TMap, TSet, TBitArray, TSparseArray, TInlineSetAllocator, TSetElement, TTuple};
 import unreal::properties::{
     EPropertyFlags, ELifetimeCondition, EArrayPropertyFlags, EMapPropertyFlags,
@@ -71,6 +72,23 @@ struct alignas(if (UE_VERSION >= 411 && UE_VERSION < 422) 8 else 4) FName {
         uint32_t Number;
         if (WITH_CASE_PRESERVING_NAME && UE_VERSION >= 501) FNameEntryId DisplayIndex;
     }
+};
+
+struct FRWLock {
+    if (os == OS_WIN32) {
+        uint8_t* Mutex;        // SRWLOCK (opaque pointer)
+    } else if (os == OS_DARWIN) {
+        uint64_t Mutex[25];    // Apple pthread_rwlock_t, 200 bytes (8 + 192)
+    } else {
+        int32_t Mutex[14];     // Linux/Android pthread_rwlock_t, 56 bytes (LP64)
+    }
+};
+
+struct FNameEntryAllocator {
+    FRWLock Lock;
+    uint32_t CurrentBlock;
+    uint32_t CurrentByteCursor;
+    (uint8_t*)* Blocks;
 };
 
 struct STUB {};
