@@ -1,4 +1,4 @@
-import unreal::core::{UE_VERSION, int8_t, uint8_t, int32_t, uint32_t, int64_t, uint64_t};
+import unreal::core::{UE_VERSION, UE_PACK_FUOBJECT_ITEM, int8_t, uint8_t, int32_t, uint32_t, int64_t, uint64_t};
 import unreal::containers::{TArray};
 import unreal::objects::{UObject};
 import unreal::unreal::{STUB, FCriticalSection};
@@ -9,7 +9,7 @@ struct FThreadSafeCounter {
 };
 
 /// TEST
-struct FUObjectItem {
+struct member_pack(if (UE_PACK_FUOBJECT_ITEM) 4 else 8) FUObjectItem {
     if (UE_VERSION >= 507) int64_t FlagsAndRefCount;
     UObject* Object;
 

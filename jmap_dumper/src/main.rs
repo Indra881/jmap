@@ -49,6 +49,10 @@ struct Cli {
     #[arg(long)]
     case_preserving: bool,
 
+    /// Build packs FUObjectItem
+    #[arg(long)]
+    pack_fuobject_item: bool,
+
     /// Target triple for struct layout, e.g. aarch64-linux-android (defaults to x86_64-pc-windows-msvc)
     #[arg(long, value_parser = jmap_dumper::structs::parse_target_triplet, value_name = "TRIPLE")]
     target: Option<jmap_dumper::structs::TargetTriplet>,
@@ -129,6 +133,8 @@ fn main() -> Result<()> {
         build_change_list: cli.build_changelist.clone(),
         // Presence of the flag forces case-preserving on; absence means auto-detect via the memory probe.
         case_preserving: cli.case_preserving.then_some(true),
+        // Presence forces packing on; absence leaves the default (off).
+        pack_fuobject_item: cli.pack_fuobject_item.then_some(true),
         target_triplet: cli.target,
     };
 

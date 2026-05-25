@@ -448,6 +448,8 @@ pub struct Config {
     pub build_change_list: Option<String>,
     #[serde(default)]
     pub case_preserving: bool,
+    #[serde(default)]
+    pub pack_fuobject_item: bool,
     #[serde(default = "structs::default_target_triplet")]
     pub target_triplet: structs::TargetTriplet,
 }
@@ -460,6 +462,7 @@ pub struct ConfigOverrides {
     pub image_base: Option<u64>,
     pub build_change_list: Option<String>,
     pub case_preserving: Option<bool>,
+    pub pack_fuobject_item: Option<bool>,
     /// Target triple: `None` defaults to win64 MSVC
     pub target_triplet: Option<structs::TargetTriplet>,
 }
@@ -473,6 +476,7 @@ impl ConfigOverrides {
             image_base: self.image_base.unwrap_or(0),
             build_change_list: self.build_change_list,
             case_preserving: self.case_preserving.unwrap_or(false),
+            pack_fuobject_item: self.pack_fuobject_item.unwrap_or(false),
             target_triplet: self
                 .target_triplet
                 .unwrap_or_else(structs::default_target_triplet),
@@ -548,6 +552,7 @@ pub async fn resolve_config(
             .clone()
             .or_else(|| results.build.as_ref().ok().map(|cl| cl.0.clone())),
         case_preserving,
+        pack_fuobject_item: overrides.pack_fuobject_item.unwrap_or(false),
         target_triplet: overrides
             .target_triplet
             .unwrap_or_else(structs::default_target_triplet),
@@ -620,6 +625,7 @@ pub async fn connect_manual(
         structs::get_struct_info_for_version(
             &engine_version,
             config.case_preserving,
+            config.pack_fuobject_item,
             config.target_triplet,
         )
         .with_context(|| {

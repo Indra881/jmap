@@ -2,6 +2,7 @@
 
 input int UE_VERSION;
 input bool WITH_CASE_PRESERVING_NAME = false;
+input bool UE_PACK_FUOBJECT_ITEM = false;
 
 // Definitions for types with explicit sizes
 type int8_t = char;

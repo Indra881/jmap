@@ -50,6 +50,7 @@ pub fn parse_target_triplet(s: &str) -> Result<TargetTriplet, String> {
 pub fn get_struct_info_for_version(
     version: &EngineVersion,
     case_preserving: bool,
+    pack_fuobject_item: bool,
     target_triplet: TargetTriplet,
 ) -> Result<Structs> {
     let compiler_instance = CompilerInstance::create(Default::default());
@@ -130,7 +131,8 @@ pub fn get_struct_info_for_version(
     let vm_options = GospelVMOptions::default()
         .target_triplet(target_triplet)
         .with_global("UE_VERSION", ue_version)
-        .with_global("WITH_CASE_PRESERVING_NAME", case_preserving as u64);
+        .with_global("WITH_CASE_PRESERVING_NAME", case_preserving as u64)
+        .with_global("UE_PACK_FUOBJECT_ITEM", pack_fuobject_item as u64);
     let mut execution_context = GospelVMRunContext::create(vm_options);
 
     for (file_name, struct_name) in struct_names {
