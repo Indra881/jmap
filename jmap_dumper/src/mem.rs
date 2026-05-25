@@ -185,6 +185,150 @@ impl<M: Mem> Mem for BlockCache<M> {
     }
 }
 
+const MH_MAGIC_64: u32 = 0xfeedfacf;
+const LC_SEGMENT_64: u32 = 0x19;
+const MH_CORE: u32 = 4;
+
+#[derive(Debug, Clone, Copy)]
+struct MachoSegment {
+    vmaddr: u64,
+    fileoff: u64,
+    filesize: u64,
+}
+
+pub struct MachoCoreMem {
+    mmap: memmap2::Mmap,
+    segments: Vec<MachoSegment>,
+}
+
+impl MachoCoreMem {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let p = path.as_ref();
+        let file = std::fs::File::open(p).with_context(|| format!("opening {}", p.display()))?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+
+        if mmap.len() < 32 {
+            anyhow::bail!("file too small to be a Mach-O");
+        }
+        let magic = u32::from_le_bytes(mmap[0..4].try_into().unwrap());
+        if magic != MH_MAGIC_64 {
+            anyhow::bail!(
+                "not a 64-bit little-endian Mach-O (magic 0x{magic:08x}); FAT/big-endian cores aren't supported"
+            );
+        }
+        let filetype = u32::from_le_bytes(mmap[12..16].try_into().unwrap());
+        let ncmds = u32::from_le_bytes(mmap[16..20].try_into().unwrap()) as usize;
+        let sizeofcmds = u32::from_le_bytes(mmap[20..24].try_into().unwrap()) as usize;
+        if filetype != MH_CORE {
+            eprintln!(
+                "note: Mach-O filetype is {filetype} (expected {MH_CORE} = MH_CORE); proceeding anyway"
+            );
+        }
+
+        let cmds_start = 32usize;
+        let cmds_end = cmds_start
+            .checked_add(sizeofcmds)
+            .context("sizeofcmds overflow")?;
+        if cmds_end > mmap.len() {
+            anyhow::bail!("load commands extend past file end");
+        }
+
+        let mut segments = Vec::new();
+        let mut off = cmds_start;
+        for _ in 0..ncmds {
+            if off + 8 > cmds_end {
+                anyhow::bail!("truncated load command at offset 0x{off:x}");
+            }
+            let cmd = u32::from_le_bytes(mmap[off..off + 4].try_into().unwrap());
+            let cmdsize = u32::from_le_bytes(mmap[off + 4..off + 8].try_into().unwrap()) as usize;
+            if cmdsize < 8 || off + cmdsize > cmds_end {
+                anyhow::bail!("invalid load command size at offset 0x{off:x}");
+            }
+            if cmd == LC_SEGMENT_64 {
+                // segment_command_64 layout (skipping segname[16] @ +8):
+                //   +24 u64 vmaddr, +32 u64 vmsize, +40 u64 fileoff, +48 u64 filesize
+                if cmdsize < 56 {
+                    anyhow::bail!("LC_SEGMENT_64 too small at offset 0x{off:x}");
+                }
+                let vmaddr = u64::from_le_bytes(mmap[off + 24..off + 32].try_into().unwrap());
+                let _vmsize = u64::from_le_bytes(mmap[off + 32..off + 40].try_into().unwrap());
+                let fileoff = u64::from_le_bytes(mmap[off + 40..off + 48].try_into().unwrap());
+                let filesize = u64::from_le_bytes(mmap[off + 48..off + 56].try_into().unwrap());
+                if filesize > 0 {
+                    if (fileoff as usize)
+                        .checked_add(filesize as usize)
+                        .is_none_or(|end| end > mmap.len())
+                    {
+                        anyhow::bail!(
+                            "segment va=0x{vmaddr:x} backs file [0x{fileoff:x}..) past file end"
+                        );
+                    }
+                    segments.push(MachoSegment {
+                        vmaddr,
+                        fileoff,
+                        filesize,
+                    });
+                }
+            }
+            off += cmdsize;
+        }
+        segments.sort_by_key(|s| s.vmaddr);
+
+        Ok(Self { mmap, segments })
+    }
+}
+
+#[async_trait(?Send)]
+impl Mem for MachoCoreMem {
+    async fn read_buf(&self, address: u64, buf: &mut [u8]) -> Result<()> {
+        let total = buf.len();
+        let read_end = address
+            .checked_add(total as u64)
+            .context("read length overflow")?;
+
+        // First segment whose backed range may contain `address`.
+        let start_idx = self
+            .segments
+            .partition_point(|s| s.vmaddr + s.filesize <= address);
+
+        let mut bytes_read = 0usize;
+        for seg in &self.segments[start_idx..] {
+            if bytes_read >= total {
+                break;
+            }
+            if seg.vmaddr >= read_end {
+                break;
+            }
+            let cur = address + bytes_read as u64;
+            // segment range: [seg.vmaddr, seg.vmaddr + seg.filesize)
+            if cur < seg.vmaddr {
+                // gap before this segment — leave bytes_read as-is, bail below
+                break;
+            }
+            let off_in_seg = cur - seg.vmaddr;
+            if off_in_seg >= seg.filesize {
+                continue;
+            }
+            let avail = (seg.filesize - off_in_seg) as usize;
+            let want = total - bytes_read;
+            let n = avail.min(want);
+            let file_off = (seg.fileoff + off_in_seg) as usize;
+            buf[bytes_read..bytes_read + n].copy_from_slice(&self.mmap[file_off..file_off + n]);
+            bytes_read += n;
+        }
+
+        if bytes_read < total {
+            anyhow::bail!(
+                "Mach-O core: only read {}/{} bytes starting at address 0x{:x}",
+                bytes_read,
+                total,
+                address
+            );
+        }
+        Ok(())
+    }
+}
+
 // --- ProcessHandle ---
 
 pub struct ProcessHandle {

@@ -20,7 +20,7 @@ use jmap::{
     EnumPropertyValue, Function, Jmap, Metadata, Object, ObjectType, Package, Property,
     PropertyType, PropertyValue, ScriptStruct, Struct,
 };
-use mem::{BlockCache, Ctx, ProcessHandle, Ptr};
+use mem::{BlockCache, Ctx, MachoCoreMem, ProcessHandle, Ptr};
 use objects::FOptionalProperty;
 use ordermap::OrderMap;
 use patternsleuth::image::Image;
@@ -318,6 +318,7 @@ pub enum Input {
     Process(i32),
     Dump(PathBuf),
     ConcatDump(PathBuf),
+    MachoCore(PathBuf),
 }
 
 #[derive(Default)]
@@ -382,6 +383,19 @@ async fn dump_async(
             )?;
             let source_name = path.file_name().unwrap_or_default().to_string_lossy();
             let mem = ConcatMem::open(&path)?;
+            let ctx = connect_manual(mem, config, struct_info, options.verbose).await?;
+            dump_inner(ctx, &source_name, options).await
+        }
+        Input::MachoCore(path) => {
+            let mut overrides = overrides;
+            overrides
+                .target_triplet
+                .get_or_insert_with(structs::macos_target_triplet);
+            let config = overrides.into_complete().context(
+                "Mach-O cores require manual config (--fname-pool, --guobject-array, --engine-version)",
+            )?;
+            let source_name = path.file_name().unwrap_or_default().to_string_lossy();
+            let mem = BlockCache::wrap(MachoCoreMem::open(&path)?);
             let ctx = connect_manual(mem, config, struct_info, options.verbose).await?;
             dump_inner(ctx, &source_name, options).await
         }

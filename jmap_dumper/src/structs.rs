@@ -43,6 +43,14 @@ pub fn default_target_triplet() -> TargetTriplet {
     }
 }
 
+pub fn macos_target_triplet() -> TargetTriplet {
+    TargetTriplet {
+        arch: TargetArchitecture::ARM64,
+        sys: TargetOperatingSystem::Darwin,
+        env: None,
+    }
+}
+
 pub fn parse_target_triplet(s: &str) -> Result<TargetTriplet, String> {
     TargetTriplet::parse(s).ok_or_else(|| format!("invalid target triple {s:?}"))
 }
