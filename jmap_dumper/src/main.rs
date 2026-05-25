@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, fs::File, io::BufWriter, path::PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None,
-        group = ArgGroup::new("input").args(&["pid", "minidump", "jmap"]).required(true))]
+        group = ArgGroup::new("input").args(&["pid", "minidump", "jmap", "cdmp"]).required(true))]
 struct Cli {
     /// Dump from process ID
     #[arg(long, short, group = "input")]
@@ -20,6 +20,10 @@ struct Cli {
     /// Use existing .jmap dump
     #[arg(long, short, group = "input")]
     jmap: Option<PathBuf>,
+
+    /// Dump from an offline concatenated-chunk dump file
+    #[arg(long, group = "input", value_name = "FILE")]
+    cdmp: Option<PathBuf>,
 
     /// FNamePool address
     #[arg(long, value_parser = parse_hex_u64, value_name = "HEX")]
@@ -143,6 +147,8 @@ fn main() -> Result<()> {
         jmap_dumper::dump(Input::Process(pid), overrides, struct_info, options)?
     } else if let Some(path) = cli.minidump {
         jmap_dumper::dump(Input::Dump(path), overrides, struct_info, options)?
+    } else if let Some(path) = cli.cdmp {
+        jmap_dumper::dump(Input::ConcatDump(path), overrides, struct_info, options)?
     } else {
         unreachable!();
     };

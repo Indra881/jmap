@@ -212,9 +212,112 @@ impl mem::Mem for MinidumpMem<'_> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ChunkEntry {
+    address: u64,
+    offset: u64,
+    length: u64,
+}
+
+/// Dead simple memory dump layout. Concatenated memory blocks with address mapping index at the end.
+#[derive(Clone)]
+pub struct ConcatMem {
+    data: Arc<memmap2::Mmap>,
+    chunks: Arc<[ChunkEntry]>,
+}
+
+impl ConcatMem {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
+        Self::new(Arc::new(mmap))
+    }
+
+    fn new(data: Arc<memmap2::Mmap>) -> Result<Self> {
+        if data.len() < 8 {
+            bail!("File too small");
+        }
+
+        let index_offset = u64::from_le_bytes(data[data.len() - 8..].try_into().unwrap()) as usize;
+
+        if index_offset + 8 > data.len() {
+            bail!("Invalid index offset");
+        }
+
+        let num_chunks =
+            u64::from_le_bytes(data[index_offset..index_offset + 8].try_into().unwrap()) as usize;
+
+        let mut chunks = Vec::with_capacity(num_chunks);
+        let mut pos = index_offset + 8;
+
+        for _ in 0..num_chunks {
+            if pos + 24 > data.len() {
+                bail!("Invalid chunk entry");
+            }
+
+            let address = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            let offset = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
+            let length = u64::from_le_bytes(data[pos + 16..pos + 24].try_into().unwrap());
+
+            chunks.push(ChunkEntry {
+                address,
+                offset,
+                length,
+            });
+            pos += 24;
+        }
+
+        chunks.sort_by_key(|chunk| chunk.address);
+
+        Ok(Self {
+            data,
+            chunks: chunks.into(),
+        })
+    }
+
+    fn find_chunk(&self, address: u64) -> Option<&ChunkEntry> {
+        self.chunks
+            .binary_search_by(|chunk| {
+                if address < chunk.address {
+                    std::cmp::Ordering::Greater
+                } else if address >= chunk.address + chunk.length {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()
+            .map(|idx| &self.chunks[idx])
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl mem::Mem for ConcatMem {
+    async fn read_buf(&self, address: u64, buf: &mut [u8]) -> Result<()> {
+        let chunk = self
+            .find_chunk(address)
+            .ok_or_else(|| anyhow::anyhow!("Address {:#x} not found in any chunk", address))?;
+
+        let offset_in_chunk = (address - chunk.address) as usize;
+        let file_offset = chunk.offset as usize + offset_in_chunk;
+
+        if file_offset + buf.len() > self.data.len() {
+            bail!("Read beyond file bounds");
+        }
+
+        if offset_in_chunk + buf.len() > chunk.length as usize {
+            bail!("Read beyond chunk bounds");
+        }
+
+        buf.copy_from_slice(&self.data[file_offset..file_offset + buf.len()]);
+        Ok(())
+    }
+}
+
 pub enum Input {
     Process(i32),
     Dump(PathBuf),
+    ConcatDump(PathBuf),
 }
 
 #[derive(Default)]
@@ -271,6 +374,15 @@ async fn dump_async(
                     connect(mem, &dump.image, overrides, struct_info, options.verbose).await?
                 }
             };
+            dump_inner(ctx, &source_name, options).await
+        }
+        Input::ConcatDump(path) => {
+            let config = overrides.into_complete().context(
+                "concat dumps require manual config (--fname-pool, --guobject-array, --engine-version)",
+            )?;
+            let source_name = path.file_name().unwrap_or_default().to_string_lossy();
+            let mem = ConcatMem::open(&path)?;
+            let ctx = connect_manual(mem, config, struct_info, options.verbose).await?;
             dump_inner(ctx, &source_name, options).await
         }
     }
