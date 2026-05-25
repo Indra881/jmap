@@ -254,80 +254,115 @@ pub async fn extract_fnames(ctx: &Ctx) -> Result<BTreeMap<u32, String>> {
     let case_preserving = ctx.case_preserving;
 
     if ue_version < (4, 22) {
-        anyhow::bail!("unimplemented fname extraction for < 4.22")
-    } else {
-        let block_len = 0x20000;
+        let per_chunk: usize = 0x4000;
+        let chunk_table = ctx.read::<u64>(fname_pool_address).await?;
 
-        let block_count = {
-            let mut buf = [0u8; 4];
-            ctx.read_buf(fname_pool_address + 8, &mut buf).await?;
-            u32::from_le_bytes(buf) as usize
-        };
-
-        for block_index in 0..=block_count {
-            let block_ptr = {
-                let mut buf = [0u8; 8];
-                ctx.read_buf(
-                    fname_pool_address + 0x10 + (block_index as u64) * 8,
-                    &mut buf,
-                )
+        for chunk_index in 0..0x400usize {
+            let chunk_ptr = ctx
+                .read::<u64>(chunk_table + (chunk_index as u64) * 8)
                 .await?;
-                u64::from_le_bytes(buf)
+            if chunk_ptr == 0 {
+                break;
+            }
+
+            let slots = match ctx.read_vec::<u64>(chunk_ptr, per_chunk).await {
+                Ok(s) => s,
+                Err(_) => break,
             };
 
-            let mut chunk = vec![0u8; block_len];
+            for (slot_index, &entry_ptr) in slots.iter().enumerate() {
+                if entry_ptr == 0 {
+                    continue;
+                }
+                let comparison_index = (chunk_index * per_chunk + slot_index) as u32;
+                if let Ok(name) = resolve_fname(ctx, comparison_index, 0).await {
+                    names.insert(comparison_index, name);
+                }
+            }
+        }
+    } else {
+        // versions >= 4.22
+        let stride: usize = if case_preserving { 4 } else { 2 };
+        let header_off: usize = if case_preserving { 4 } else { 0 };
+        let data_off: usize = if case_preserving { 6 } else { 2 };
+        let block_size: usize = stride * 0x10000;
+
+        let current_block_off = ctx.struct_member("FNameEntryAllocator", "CurrentBlock") as u64;
+        let byte_cursor_off = ctx.struct_member("FNameEntryAllocator", "CurrentByteCursor") as u64;
+        let blocks_off = ctx.struct_member("FNameEntryAllocator", "Blocks") as u64;
+
+        let current_block = ctx
+            .read::<u32>(fname_pool_address + current_block_off)
+            .await? as usize;
+        let current_byte_cursor = ctx
+            .read::<u32>(fname_pool_address + byte_cursor_off)
+            .await? as usize;
+
+        for block_index in 0..=current_block {
+            let block_ptr = ctx
+                .read::<u64>(fname_pool_address + blocks_off + (block_index as u64) * 8)
+                .await?;
+            if block_ptr == 0 {
+                continue;
+            }
+
+            let read_len = if block_index == current_block {
+                current_byte_cursor
+            } else {
+                block_size
+            };
+            if read_len == 0 {
+                continue;
+            }
+
+            let mut chunk = vec![0u8; read_len];
             if ctx.read_buf(block_ptr, &mut chunk).await.is_err() {
                 continue;
             }
 
-            let mut possible = vec![];
-            let mut i = 2;
-            let mut bytes_iter = chunk.iter().skip(2);
+            let mut cursor = 0usize;
+            while cursor + header_off + 2 <= chunk.len() {
+                let h = cursor + header_off;
+                let header = u16::from_le_bytes([chunk[h], chunk[h + 1]]);
 
-            // assume FNames cannot contain chars < 32
-            while let Some(pos) = bytes_iter.position(|b| !(32..).contains(b)) {
-                possible.push((i - 2)..(i + pos + 1));
-                i += pos + 1;
-            }
+                let len = if case_preserving {
+                    (header >> 1) as usize
+                } else {
+                    (header >> 6) as usize
+                };
+                let is_wide = (header & 1) != 0;
 
-            // Validate potential FName entries in printable regions
-            for range in &possible {
-                let base = range.start;
-                let p = &chunk[range.clone()];
-                for i in 2..p.len() {
-                    let index = base + i - 2;
-
-                    // filter invalid alignment
-                    if case_preserving {
-                        if index % 4 != 0 {
-                            continue;
-                        }
-                    } else if index % 2 != 0 {
-                        continue;
-                    }
-
-                    let header = ((p[i - 1] as u16) << 8) + p[i - 2] as u16;
-
-                    let len = if case_preserving {
-                        (header >> 1) as usize
-                    } else {
-                        (header >> 6) as usize
-                    };
-                    let is_wide = (header & 1) != 0;
-
-                    if len > 0
-                        && !is_wide
-                        && i + len < p.len()
-                        && let Ok(name) = String::from_utf8(p[i..(i + len)].to_vec())
-                    {
-                        let value = if case_preserving {
-                            ((block_index << 16) | (index / 4)) as u32
-                        } else {
-                            ((block_index << 16) | (index / 2)) as u32
-                        };
-                        names.insert(value, name);
-                    }
+                if len == 0 {
+                    break;
                 }
+
+                let char_size = if is_wide { 2 } else { 1 };
+                let data_start = cursor + data_off;
+                let data_end = data_start + len * char_size;
+                if data_end > chunk.len() {
+                    break;
+                }
+
+                let decoded = if is_wide {
+                    let units: Vec<u16> = chunk[data_start..data_end]
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    String::from_utf16(&units).ok()
+                } else {
+                    String::from_utf8(chunk[data_start..data_end].to_vec()).ok()
+                };
+
+                if let Some(name) = decoded {
+                    let value = ((block_index << 16) | (cursor / stride)) as u32;
+                    names.insert(value, name);
+                }
+
+                let size = (data_off + len * char_size).next_multiple_of(stride);
+                if size == 0 {
+                    break;
+                }
+                cursor += size;
             }
         }
     }
