@@ -23,7 +23,7 @@ use mem::{Ctx, MemCache, ProcessHandle, Ptr};
 use objects::FOptionalProperty;
 use ordermap::OrderMap;
 use patternsleuth::image::Image;
-use patternsleuth::resolvers::{impl_collector, impl_try_collector, resolve};
+use patternsleuth::resolvers::{impl_collector, resolve};
 
 use crate::containers::{FUtf8String, extract_fnames};
 use crate::objects::{
@@ -35,19 +35,12 @@ use crate::objects::{
 };
 use crate::structs::Structs;
 
-impl_try_collector! {
+impl_collector! {
     #[derive(Debug, PartialEq, Clone)]
     struct Resolution {
         guobject_array: patternsleuth::resolvers::unreal::guobject_array::GUObjectArray,
         fname_pool: patternsleuth::resolvers::unreal::fname::FNamePool,
         engine_version: patternsleuth::resolvers::unreal::engine_version::EngineVersion,
-        opt: OptResolution,
-    }
-}
-
-impl_collector! {
-    #[derive(Debug, PartialEq, Clone)]
-    struct OptResolution {
         build: patternsleuth::resolvers::unreal::engine_version::BuildChangeList,
         fname_constant: patternsleuth::resolvers::unreal::fname::StaticFNameConst,
     }
@@ -137,13 +130,22 @@ pub struct OpenMinidump {
     pub image: patternsleuth::image::Image<'static>,
 }
 
-/// Open a minidump file, leaking the mmap and parsed minidump to get `'static` lifetimes.
-pub fn open_minidump(path: impl AsRef<std::path::Path>) -> Result<OpenMinidump> {
+/// Load and leak a minidump to `'static`, *without* building a patternsleuth
+pub fn load_minidump(
+    path: impl AsRef<std::path::Path>,
+) -> Result<&'static minidump::Minidump<'static, &'static [u8]>> {
     let file = std::fs::File::open(path)?;
     let mmap: &'static memmap2::Mmap =
         Box::leak(Box::new(unsafe { memmap2::MmapOptions::new().map(&file)? }));
     let minidump: &'static minidump::Minidump<'static, &'static [u8]> =
         Box::leak(Box::new(minidump::Minidump::read(&**mmap)?));
+    Ok(minidump)
+}
+
+/// Open a minidump file, leaking the mmap and parsed minidump to get `'static`
+/// lifetimes, and build a patternsleuth image for resolution.
+pub fn open_minidump(path: impl AsRef<std::path::Path>) -> Result<OpenMinidump> {
+    let minidump = load_minidump(path)?;
     let image = patternsleuth::image::pe::read_image_from_minidump(minidump)?;
     Ok(OpenMinidump { minidump, image })
 }
@@ -221,23 +223,41 @@ pub struct DumpOptions {
     pub verbose: bool,
 }
 
-pub fn dump(input: Input, struct_info: Option<Structs>, options: DumpOptions) -> Result<Jmap> {
+pub fn dump(
+    input: Input,
+    overrides: ConfigOverrides,
+    struct_info: Option<Structs>,
+    options: DumpOptions,
+) -> Result<Jmap> {
     match input {
         Input::Process(pid) => {
             let source_name = proc_name::get_process_name(pid).unwrap_or_default();
 
             let handle: ProcessHandle = ProcessHandle::new(pid);
             let mem = MemCache::wrap(handle);
-            let image = patternsleuth::process::external::read_image_from_pid(pid)?;
-            let ctx = connect(mem, &image, struct_info, options.verbose)?;
+            let ctx = match overrides.clone().into_complete() {
+                Some(config) => connect_manual(mem, config, struct_info, options.verbose)?,
+                None => {
+                    let image = patternsleuth::process::external::read_image_from_pid(pid)?;
+                    connect(mem, &image, overrides, struct_info, options.verbose)?
+                }
+            };
             dump_inner(ctx, &source_name, options)
         }
         Input::Dump(path) => {
             let source_name = path.file_name().unwrap_or_default().to_string_lossy();
 
-            let dump = open_minidump(&path)?;
-            let mem = MinidumpMem::new(dump.minidump)?;
-            let ctx = connect(mem, &dump.image, struct_info, options.verbose)?;
+            let ctx = match overrides.clone().into_complete() {
+                Some(config) => {
+                    let mem = MinidumpMem::new(load_minidump(&path)?)?;
+                    connect_manual(mem, config, struct_info, options.verbose)?
+                }
+                None => {
+                    let dump = open_minidump(&path)?;
+                    let mem = MinidumpMem::new(dump.minidump)?;
+                    connect(mem, &dump.image, overrides, struct_info, options.verbose)?
+                }
+            };
             dump_inner(ctx, &source_name, options)
         }
     }
@@ -276,76 +296,208 @@ pub fn connect_pid(pid: i32, struct_info: Option<Structs>) -> Result<Ctx> {
     let handle: ProcessHandle = ProcessHandle::new(pid);
     let mem = MemCache::wrap(handle);
     let image = patternsleuth::process::external::read_image_from_pid(pid)?;
-    connect(mem, &image, struct_info, false)
+    connect(mem, &image, ConfigOverrides::default(), struct_info, false)
 }
 
 pub fn connect_pid_live(pid: i32, struct_info: Option<Structs>) -> Result<Ctx> {
     let handle: ProcessHandle = ProcessHandle::new(pid);
     let image = patternsleuth::process::external::read_image_from_pid(pid)?;
-    connect(handle, &image, struct_info, false)
+    connect(
+        handle,
+        &image,
+        ConfigOverrides::default(),
+        struct_info,
+        false,
+    )
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Config {
+    pub guobject_array: u64,
+    pub fname_pool: u64,
+    pub engine_version: (u16, u16),
+    #[serde(default)]
+    pub image_base: u64,
+    #[serde(default)]
+    pub build_change_list: Option<String>,
+    #[serde(default)]
+    pub case_preserving: bool,
+    #[serde(default = "structs::default_target_triplet")]
+    pub target_triplet: structs::TargetTriplet,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConfigOverrides {
+    pub guobject_array: Option<u64>,
+    pub fname_pool: Option<u64>,
+    pub engine_version: Option<(u16, u16)>,
+    pub image_base: Option<u64>,
+    pub build_change_list: Option<String>,
+    pub case_preserving: Option<bool>,
+    /// Target triple: `None` defaults to win64 MSVC
+    pub target_triplet: Option<structs::TargetTriplet>,
+}
+
+impl ConfigOverrides {
+    pub fn into_complete(self) -> Option<Config> {
+        Some(Config {
+            guobject_array: self.guobject_array?,
+            fname_pool: self.fname_pool?,
+            engine_version: self.engine_version?,
+            image_base: self.image_base.unwrap_or(0),
+            build_change_list: self.build_change_list,
+            case_preserving: self.case_preserving.unwrap_or(false),
+            target_triplet: self
+                .target_triplet
+                .unwrap_or_else(structs::default_target_triplet),
+        })
+    }
+}
+
+pub fn resolve_config(
+    mem: &impl mem::Mem,
+    image: &Image<'_>,
+    overrides: &ConfigOverrides,
+) -> Result<Config> {
+    let results = resolve(image, Resolution::resolver())?;
+    println!("{results:X?}");
+
+    let engine_version = overrides.engine_version.or_else(|| {
+        results
+            .engine_version
+            .as_ref()
+            .ok()
+            .map(|v| (v.major, v.minor))
+    });
+    let guobject_array = overrides
+        .guobject_array
+        .or_else(|| results.guobject_array.as_ref().ok().map(|r| r.0));
+    let fname_pool = overrides
+        .fname_pool
+        .or_else(|| results.fname_pool.as_ref().ok().map(|r| r.0));
+
+    let mut missing = Vec::new();
+    if engine_version.is_none() {
+        missing.push("--engine-version");
+    }
+    if guobject_array.is_none() {
+        missing.push("--guobject-array");
+    }
+    if fname_pool.is_none() {
+        missing.push("--fname-pool");
+    }
+    if !missing.is_empty() {
+        bail!(
+            "patternsleuth could not resolve {} and no manual value was supplied; pass {} to fill in the missing value(s)",
+            missing
+                .iter()
+                .map(|f| f.trim_start_matches("--"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            missing.join(" "),
+        );
+    }
+    let engine_version = engine_version.unwrap();
+    let guobject_array = guobject_array.unwrap();
+    let fname_pool = fname_pool.unwrap();
+
+    let case_preserving = match overrides.case_preserving {
+        Some(cp) => cp,
+        None => detect_case_preserving(mem, &results, engine_version)?,
+    };
+
+    Ok(Config {
+        guobject_array,
+        fname_pool,
+        engine_version,
+        image_base: overrides.image_base.unwrap_or(image.base_address),
+        build_change_list: overrides
+            .build_change_list
+            .clone()
+            .or_else(|| results.build.as_ref().ok().map(|cl| cl.0.clone())),
+        case_preserving,
+        target_triplet: overrides
+            .target_triplet
+            .unwrap_or_else(structs::default_target_triplet),
+    })
+}
+
+fn detect_case_preserving(
+    mem: &impl mem::Mem,
+    results: &Resolution,
+    version: (u16, u16),
+) -> Result<bool> {
+    let Ok(fname_constant) = &results.fname_constant else {
+        return Ok(false);
+    };
+    let name_constant_address = fname_constant.0;
+    let read_u32 = |addr: u64| -> Result<u32> {
+        let mut buf = [0u8; 4];
+        mem.read_buf(addr, &mut buf)?;
+        Ok(u32::from_le_bytes(buf))
+    };
+
+    // Field offsets mirror the FName layout in jmap_dumper/unreal/src/unreal.gs:
+    //         UE <  4.23: [CMP, NUM]
+    // 4.23 <= UE <  5.01: [CMP, DISP?, NUM]   (DISP only when case-preserving)
+    //         UE >= 5.01: [CMP, NUM, DISP?]
+    let comparison_index = read_u32(name_constant_address)?;
+    assert_ne!(comparison_index, 0);
+
+    let (case_preserving_detected, number_off) = if version < (4, 23) {
+        (false, 4)
+    } else if version < (5, 1) {
+        if read_u32(name_constant_address + 4)? == comparison_index {
+            (true, 8)
+        } else {
+            (false, 4)
+        }
+    } else {
+        let cp = read_u32(name_constant_address + 8)? == comparison_index;
+        (cp, 4)
+    };
+
+    let number = read_u32(name_constant_address + number_off)?;
+    assert_eq!(
+        number, 0,
+        "Builds with outlined name number (UE_FNAME_OUTLINE_NUMBER=1) are not supported"
+    );
+    Ok(case_preserving_detected)
 }
 
 pub fn connect(
     mem: impl mem::Mem + 'static,
     image: &Image<'_>,
+    overrides: ConfigOverrides,
     struct_info: Option<Structs>,
     verbose: bool,
 ) -> Result<Ctx> {
-    let results = resolve(image, Resolution::resolver())?;
-    println!("{results:X?}");
+    let config = resolve_config(&mem, image, &overrides)?;
+    connect_manual(mem, config, struct_info, verbose)
+}
 
-    let fnamepool = results.fname_pool.0;
-
-    let version = (results.engine_version.major, results.engine_version.minor);
-
-    let mut case_preserving = false;
-
-    if let Ok(fname_constant) = &results.opt.fname_constant {
-        let name_constant_address = fname_constant.0;
-        let read_u32 = |addr: u64| -> Result<u32> {
-            let mut buf = [0u8; 4];
-            mem.read_buf(addr, &mut buf)?;
-            Ok(u32::from_le_bytes(buf))
-        };
-
-        // Field offsets mirror the FName layout in jmap_dumper/unreal/src/unreal.gs:
-        //         UE <  4.23: [CMP, NUM]
-        // 4.23 <= UE <  5.01: [CMP, DISP?, NUM]   (DISP only when case-preserving)
-        //         UE >= 5.01: [CMP, NUM, DISP?]
-        let comparison_index = read_u32(name_constant_address)?;
-        assert_ne!(comparison_index, 0);
-
-        let (case_preserving_detected, number_off) = if version < (4, 23) {
-            (false, 4)
-        } else if version < (5, 1) {
-            if read_u32(name_constant_address + 4)? == comparison_index {
-                (true, 8)
-            } else {
-                (false, 4)
-            }
-        } else {
-            let cp = read_u32(name_constant_address + 8)? == comparison_index;
-            (cp, 4)
-        };
-
-        let number = read_u32(name_constant_address + number_off)?;
-        assert_eq!(
-            number, 0,
-            "Builds with outlined name number (UE_FNAME_OUTLINE_NUMBER=1) are not supported"
-        );
-        case_preserving = case_preserving_detected;
-    }
+pub fn connect_manual(
+    mem: impl mem::Mem + 'static,
+    config: Config,
+    struct_info: Option<Structs>,
+    verbose: bool,
+) -> Result<Ctx> {
+    let engine_version = patternsleuth::resolvers::unreal::engine_version::EngineVersion {
+        major: config.engine_version.0,
+        minor: config.engine_version.1,
+    };
 
     let struct_info = if let Some(provided_info) = struct_info {
         provided_info
     } else {
-        structs::get_struct_info_for_version(&results.engine_version, case_preserving)
-            .with_context(|| {
-                format!(
-                    "Failed to compute struct offsets via Gospel for {:?}",
-                    results.engine_version
-                )
-            })?
+        structs::get_struct_info_for_version(
+            &engine_version,
+            config.case_preserving,
+            config.target_triplet,
+        )
+        .with_context(|| {
+            format!("Failed to compute struct offsets via Gospel for {engine_version:?}")
+        })?
     };
 
     if verbose {
@@ -354,17 +506,17 @@ pub fn connect(
 
     Ok(Ctx::new(mem::CtxInner {
         mem: Box::new(mem),
-        fnamepool,
+        fnamepool: config.fname_pool,
         structs: struct_info
             .0
             .into_iter()
             .map(|s| (s.name.clone(), s))
             .collect(),
-        version,
-        case_preserving,
-        uobjectarray: results.guobject_array.0,
-        image_base_address: image.base_address,
-        build_change_list: results.opt.build.as_ref().ok().map(|cl| cl.0.clone()),
+        version: config.engine_version,
+        case_preserving: config.case_preserving,
+        uobjectarray: config.guobject_array,
+        image_base_address: config.image_base,
+        build_change_list: config.build_change_list,
     }))
 }
 

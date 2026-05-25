@@ -714,13 +714,14 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 [[package]]
 name = "gospel-compiler"
 version = "0.1.0"
-source = "git+https://github.com/trumank/gospel#6bbaaac5cb912cc02b8e46c0861d4d32f25637b9"
+source = "git+https://github.com/trumank/gospel#60f85b2a2406ee2e8b7c24c9f37de422d72b58a2"
 dependencies = [
  "anyhow",
  "clap",
  "fancy-regex",
  "gospel-typelib",
  "gospel-vm",
+ "include_dir",
  "itertools 0.14.0",
  "logos",
  "semver",
@@ -728,13 +729,12 @@ dependencies = [
  "serde_json",
  "strum 0.27.2",
  "toml",
- "walkdir",
 ]
 
 [[package]]
 name = "gospel-typelib"
 version = "0.1.0"
-source = "git+https://github.com/trumank/gospel#6bbaaac5cb912cc02b8e46c0861d4d32f25637b9"
+source = "git+https://github.com/trumank/gospel#60f85b2a2406ee2e8b7c24c9f37de422d72b58a2"
 dependencies = [
  "anyhow",
  "lazy_static",
@@ -748,7 +748,7 @@ dependencies = [
 [[package]]
 name = "gospel-vm"
 version = "0.1.0"
-source = "git+https://github.com/trumank/gospel#6bbaaac5cb912cc02b8e46c0861d4d32f25637b9"
+source = "git+https://github.com/trumank/gospel#60f85b2a2406ee2e8b7c24c9f37de422d72b58a2"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -1409,7 +1409,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn",
@@ -1575,15 +1575,6 @@ dependencies = [
  "byteorder",
  "derive_more",
  "twox-hash",
-]
-
-[[package]]
-name = "same-file"
-version = "1.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
-dependencies = [
- "winapi-util",
 ]
 
 [[package]]
@@ -2074,16 +2065,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
-name = "walkdir"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
-dependencies = [
- "same-file",
- "winapi-util",
-]
-
-[[package]]
 name = "wasip2"
 version = "1.0.2+wasi-0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2152,15 +2133,6 @@ name = "winapi-i686-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
-
-[[package]]
-name = "winapi-util"
-version = "0.1.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
-dependencies = [
- "windows-sys",
-]
 
 [[package]]
 name = "winapi-x86_64-pc-windows-gnu"

@@ -1,7 +1,7 @@
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Parser};
 use jmap::Jmap;
-use jmap_dumper::{DumpOptions, Input, into_header, structs::Structs};
+use jmap_dumper::{ConfigOverrides, DumpOptions, Input, into_header, structs::Structs};
 use std::io::Cursor;
 use std::{collections::BTreeMap, fs::File, io::BufWriter, path::PathBuf};
 
@@ -20,6 +20,34 @@ struct Cli {
     /// Use existing .jmap dump
     #[arg(long, short, group = "input")]
     jmap: Option<PathBuf>,
+
+    /// FNamePool address
+    #[arg(long, value_parser = parse_hex_u64, value_name = "HEX")]
+    fname_pool: Option<u64>,
+
+    /// GUObjectArray address
+    #[arg(long, value_parser = parse_hex_u64, value_name = "HEX")]
+    guobject_array: Option<u64>,
+
+    /// UE engine version, e.g. 5.4
+    #[arg(long, value_parser = parse_engine_version, value_name = "MAJOR.MINOR")]
+    engine_version: Option<(u16, u16)>,
+
+    /// Main image load address
+    #[arg(long, value_parser = parse_hex_u64, value_name = "HEX")]
+    image_base: Option<u64>,
+
+    /// Build changelist string
+    #[arg(long)]
+    build_changelist: Option<String>,
+
+    /// Build has case preserving FNames
+    #[arg(long)]
+    case_preserving: bool,
+
+    /// Target triple for struct layout, e.g. aarch64-linux-android (defaults to x86_64-pc-windows-msvc)
+    #[arg(long, value_parser = jmap_dumper::structs::parse_target_triplet, value_name = "TRIPLE")]
+    target: Option<jmap_dumper::structs::TargetTriplet>,
 
     /// Struct layout info .json (from pdb_dumper)
     #[arg(long, short)]
@@ -40,6 +68,23 @@ struct Cli {
     /// Output dump .jmap path
     #[arg(index = 1)]
     output: PathBuf,
+}
+
+fn parse_hex_u64(s: &str) -> Result<u64, String> {
+    let trimmed = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    u64::from_str_radix(trimmed, 16).map_err(|e| format!("invalid hex u64 {s:?}: {e}"))
+}
+
+fn parse_engine_version(s: &str) -> Result<(u16, u16), String> {
+    let (maj, min) = s
+        .split_once('.')
+        .ok_or_else(|| format!("expected MAJOR.MINOR, got {s:?}"))?;
+    let maj: u16 = maj.parse().map_err(|e| format!("major: {e}"))?;
+    let min: u16 = min.parse().map_err(|e| format!("minor: {e}"))?;
+    Ok((maj, min))
 }
 
 fn main() -> Result<()> {
@@ -72,6 +117,17 @@ fn main() -> Result<()> {
         verbose: cli.verbose,
     };
 
+    let overrides = ConfigOverrides {
+        guobject_array: cli.guobject_array,
+        fname_pool: cli.fname_pool,
+        engine_version: cli.engine_version,
+        image_base: cli.image_base,
+        build_change_list: cli.build_changelist.clone(),
+        // Presence of the flag forces case-preserving on; absence means auto-detect via the memory probe.
+        case_preserving: cli.case_preserving.then_some(true),
+        target_triplet: cli.target,
+    };
+
     let reflection_data: Jmap = if let Some(path) = cli.jmap {
         let filename = path.file_name().unwrap().to_str().unwrap();
         if filename.ends_with(".jmap.gz") {
@@ -84,9 +140,9 @@ fn main() -> Result<()> {
             bail!("Error: Expected .jmap or .jmap.gz file as input");
         }
     } else if let Some(pid) = cli.pid {
-        jmap_dumper::dump(Input::Process(pid), struct_info, options)?
+        jmap_dumper::dump(Input::Process(pid), overrides, struct_info, options)?
     } else if let Some(path) = cli.minidump {
-        jmap_dumper::dump(Input::Dump(path), struct_info, options)?
+        jmap_dumper::dump(Input::Dump(path), overrides, struct_info, options)?
     } else {
         unreachable!();
     };

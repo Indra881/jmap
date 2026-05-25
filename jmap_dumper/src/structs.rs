@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use gospel_compiler::backend::{CompilerInstance, CompilerModuleBuilder, CompilerResultTrait};
 use gospel_compiler::parser::parse_source_file;
 use gospel_typelib::target_triplet::{
-    TargetArchitecture, TargetEnvironment, TargetOperatingSystem, TargetTriplet,
+    TargetArchitecture, TargetEnvironment, TargetOperatingSystem,
 };
 use gospel_typelib::type_model::{ResolvedUDTMemberLayout, Type, TypeGraphLike, TypeLayoutCache};
 use gospel_vm::vm::{GospelVMOptions, GospelVMRunContext, GospelVMState, GospelVMValue};
@@ -33,16 +33,25 @@ pub struct StructMember {
     //pub type_name: String,
 }
 
-pub fn get_struct_info_for_version(
-    version: &EngineVersion,
-    case_preserving: bool,
-) -> Result<Structs> {
-    let target_triplet = TargetTriplet {
+pub use gospel_typelib::target_triplet::TargetTriplet;
+
+pub fn default_target_triplet() -> TargetTriplet {
+    TargetTriplet {
         arch: TargetArchitecture::X86_64,
         sys: TargetOperatingSystem::Win32,
         env: Some(TargetEnvironment::MSVC),
-    };
+    }
+}
 
+pub fn parse_target_triplet(s: &str) -> Result<TargetTriplet, String> {
+    TargetTriplet::parse(s).ok_or_else(|| format!("invalid target triple {s:?}"))
+}
+
+pub fn get_struct_info_for_version(
+    version: &EngineVersion,
+    case_preserving: bool,
+    target_triplet: TargetTriplet,
+) -> Result<Structs> {
     let compiler_instance = CompilerInstance::create(Default::default());
     let module_writer = compiler_instance
         .define_module("unreal")
