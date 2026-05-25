@@ -17,8 +17,8 @@ macro_rules! inherit {
                 self.cast()
             }
             #[allow(unused)]
-            pub fn path(&self) -> Result<String> {
-                self.uobject().path()
+            pub async fn path(&self) -> Result<String> {
+                self.uobject().path().await
             }
             #[allow(unused)]
             pub fn class_private(&self) -> Ptr<Ptr<UClass>> {
@@ -192,8 +192,8 @@ impl Ptr<UObject> {
         let offset = self.ctx().struct_member("UObject", "OuterPrivate");
         self.byte_offset(offset).cast()
     }
-    pub fn path(&self) -> Result<String> {
-        read_path(self)
+    pub async fn path(&self) -> Result<String> {
+        read_path(self).await
     }
 }
 
@@ -344,19 +344,19 @@ impl Ptr<FNameData> {
     }
 }
 impl Ptr<UEnum> {
-    pub fn read_names(&self) -> Result<Vec<(String, i64)>> {
+    pub async fn read_names(&self) -> Result<Vec<(String, i64)>> {
         let version = self.ctx().ue_version();
 
         if version >= (5, 7) {
             // UE 5.7+: FNameData
             let name_data: Ptr<FNameData> = self.names().cast();
-            let len = name_data.num_values().read()? as usize;
+            let len = name_data.num_values().read().await? as usize;
             if len == 0 {
                 return Ok(vec![]);
             }
 
-            let tagged_names = name_data.tagged_names().read()?;
-            let tagged_values = name_data.tagged_values().read()?;
+            let tagged_names = name_data.tagged_names().read().await?;
+            let tagged_values = name_data.tagged_values().read().await?;
             let names_addr = tagged_names & !1u64;
             let values_addr = tagged_values & !1u64;
 
@@ -366,11 +366,11 @@ impl Ptr<UEnum> {
             for i in 0..len {
                 let name_ptr: Ptr<FName> =
                     Ptr::new(names_addr + (i * fname_size) as u64, self.ctx().clone())?;
-                let name = name_ptr.read()?;
+                let name = name_ptr.read().await?;
 
                 let value_ptr: Ptr<i64> =
                     Ptr::new(values_addr + (i * 8) as u64, self.ctx().clone())?;
-                let value = value_ptr.read()?;
+                let value = value_ptr.read().await?;
 
                 names.push((name, value));
             }
@@ -378,19 +378,19 @@ impl Ptr<UEnum> {
         } else {
             // Pre-5.7: TArray<UEnumNameTuple>
             let mut names = vec![];
-            let len = self.names().len()?;
+            let len = self.names().len().await?;
             if len > 0 {
-                let data: Ptr<UEnumNameTuple> = self.names().data()?.unwrap().cast();
+                let data: Ptr<UEnumNameTuple> = self.names().data().await?.unwrap().cast();
                 let size = self.ctx().get_struct("UEnumNameTuple").size;
                 for i in 0..len {
                     let elm = data.byte_offset(i * size as usize);
-                    let name = elm.name().read()?;
+                    let name = elm.name().read().await?;
                     let value = if version < (4, 9) {
                         i as i64
                     } else if version < (4, 15) {
-                        elm.value().cast::<u8>().read()? as i64
+                        elm.value().cast::<u8>().read().await? as i64
                     } else {
-                        elm.value().cast::<i64>().read()?
+                        elm.value().cast::<i64>().read().await?
                     };
                     names.push((name, value));
                 }
@@ -411,16 +411,16 @@ impl Ptr<ZField> {
         let offset = self.ctx().struct_member("ZField", "NamePrivate");
         self.byte_offset(offset).cast()
     }
-    pub fn cast_flags(&self) -> Result<EClassCastFlags> {
+    pub async fn cast_flags(&self) -> Result<EClassCastFlags> {
         if self.ctx().ue_version() < (4, 25) {
             // UField
-            let class = self.cast::<UObject>().class_private().read()?;
-            class.class_cast_flags().read()
+            let class = self.cast::<UObject>().class_private().read().await?;
+            class.class_cast_flags().read().await
         } else {
             // FField
             let offset = self.ctx().struct_member("FField", "ClassPrivate");
             let class: Ptr<Ptr<FFieldClass>> = self.byte_offset(offset).cast();
-            class.read()?.cast_flags().read()
+            class.read().await?.cast_flags().read().await
         }
     }
 }
@@ -695,8 +695,8 @@ impl Ptr<FFixedUObjectArray> {
             .struct_member("FFixedUObjectArray", "NumElements");
         self.byte_offset(offset).cast()
     }
-    pub fn read_item_ptr(&self, item: usize) -> Result<Ptr<FUObjectItem>> {
-        Ok(self.objects().read()?.offset_item(item))
+    pub async fn read_item_ptr(&self, item: usize) -> Result<Ptr<FUObjectItem>> {
+        Ok(self.objects().read().await?.offset_item(item))
     }
 }
 
@@ -715,15 +715,17 @@ impl Ptr<FChunkedFixedUObjectArray> {
             .struct_member("FChunkedFixedUObjectArray", "NumElements");
         self.byte_offset(offset).cast()
     }
-    pub fn read_item_ptr(&self, item: usize) -> Result<Ptr<FUObjectItem>> {
+    pub async fn read_item_ptr(&self, item: usize) -> Result<Ptr<FUObjectItem>> {
         let max_per_chunk = 64 * 1024;
         let chunk_index = item / max_per_chunk;
 
         Ok(self
             .objects()
-            .read()?
+            .read()
+            .await?
             .offset(chunk_index)
-            .read()?
+            .read()
+            .await?
             .offset_item(item % max_per_chunk))
     }
 }
@@ -738,15 +740,17 @@ impl Ptr<FUObjectArrayOld> {
         let offset = self.ctx().struct_member("FUObjectArrayOld", "NumElements");
         self.byte_offset(offset).cast()
     }
-    pub fn read_item_ptr(&self, item: usize) -> Result<Option<Ptr<UObject>>> {
+    pub async fn read_item_ptr(&self, item: usize) -> Result<Option<Ptr<UObject>>> {
         let max_per_chunk = 16 * 1024;
         let chunk_index = item / max_per_chunk;
 
         self.chunks()
             .offset(chunk_index)
-            .read()?
+            .read()
+            .await?
             .offset(item % max_per_chunk)
             .read()
+            .await
     }
 }
 #[derive(Clone, Copy)]
@@ -759,8 +763,8 @@ impl Ptr<FUObjectArrayOlder> {
         let offset = self.ctx().struct_member("FUObjectArrayOlder", "ArrayNum");
         self.byte_offset(offset).cast()
     }
-    pub fn read_item_ptr(&self, item: usize) -> Result<Option<Ptr<UObject>>> {
-        self.data().read()?.offset(item).read()
+    pub async fn read_item_ptr(&self, item: usize) -> Result<Option<Ptr<UObject>>> {
+        self.data().read().await?.offset(item).read().await
     }
 }
 
@@ -771,30 +775,36 @@ impl Ptr<FUObjectArray> {
         let offset = self.ctx().struct_member("FUObjectArray", "ObjObjects");
         self.byte_offset(offset).cast()
     }
-    pub fn read_item_ptr(&self, item: usize) -> Result<Option<Ptr<UObject>>> {
+    pub async fn read_item_ptr(&self, item: usize) -> Result<Option<Ptr<UObject>>> {
         if self.ctx().ue_version() < (4, 8) {
             self.obj_objects()
                 .cast::<FUObjectArrayOlder>()
                 .read_item_ptr(item)
+                .await
         } else if self.ctx().ue_version() < (4, 11) {
             self.obj_objects()
                 .cast::<FUObjectArrayOld>()
                 .read_item_ptr(item)
+                .await
         } else if self.ctx().ue_version() < (4, 20) {
             self.obj_objects()
                 .cast::<FFixedUObjectArray>()
-                .read_item_ptr(item)?
+                .read_item_ptr(item)
+                .await?
                 .object()
                 .read()
+                .await
         } else {
             self.obj_objects()
                 .cast::<FChunkedFixedUObjectArray>()
-                .read_item_ptr(item)?
+                .read_item_ptr(item)
+                .await?
                 .object()
                 .read()
+                .await
         }
     }
-    pub fn num_elements(&self) -> Result<i32> {
+    pub async fn num_elements(&self) -> Result<i32> {
         if self.ctx().ue_version() < (4, 8) {
             self.obj_objects()
                 .cast::<FUObjectArrayOlder>()
@@ -811,6 +821,7 @@ impl Ptr<FUObjectArray> {
                 .num_elements()
         }
         .read()
+        .await
     }
 }
 
@@ -821,20 +832,17 @@ pub struct PropertyIterator {
     recurse_parents: bool,
 }
 
-impl Iterator for PropertyIterator {
-    type Item = Result<Ptr<ZProperty>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl PropertyIterator {
+    pub async fn next(&mut self) -> Option<Result<Ptr<ZProperty>>> {
         loop {
             if let Some(current) = self.current_field.take() {
-                let is_property = match current.cast_flags() {
+                let is_property = match current.cast_flags().await {
                     Ok(flags) if flags.contains(EClassCastFlags::CASTCLASS_FProperty) => true,
                     Ok(_) => false,
                     Err(e) => return Some(Err(e)),
                 };
 
-                let next = current.next().read();
-                self.current_field = match next {
+                self.current_field = match current.next().read().await {
                     Ok(next) => next,
                     Err(e) => return Some(Err(e)),
                 };
@@ -843,13 +851,13 @@ impl Iterator for PropertyIterator {
                     return Some(Ok(current.cast::<ZProperty>()));
                 }
             } else if let Some(current) = self.current_struct.take() {
-                self.current_field = match current.child_fields().read() {
+                self.current_field = match current.child_fields().read().await {
                     Ok(children) => children,
                     Err(e) => return Some(Err(e)),
                 };
 
                 if self.recurse_parents {
-                    self.current_struct = match current.super_struct().read() {
+                    self.current_struct = match current.super_struct().read().await {
                         Ok(super_struct) => super_struct,
                         Err(e) => return Some(Err(e)),
                     };

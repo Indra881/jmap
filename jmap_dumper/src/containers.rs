@@ -11,10 +11,10 @@ use crate::mem::Ptr;
 #[repr(transparent)]
 pub struct FString(pub TArray<u16>);
 impl Ptr<FString> {
-    pub fn read(&self) -> Result<String> {
+    pub async fn read(&self) -> Result<String> {
         let array = self.cast::<TArray<u16>>();
-        Ok(if let Some(chars) = array.data()? {
-            let chars = chars.read_vec(array.len()?)?;
+        Ok(if let Some(chars) = array.data().await? {
+            let chars = chars.read_vec(array.len().await?).await?;
             let len = chars.iter().position(|c| *c == 0).unwrap_or(chars.len());
             String::from_utf16(&chars[..len])?
         } else {
@@ -27,10 +27,10 @@ impl Ptr<FString> {
 #[repr(transparent)]
 pub struct FUtf8String(pub TArray<u16>);
 impl Ptr<FUtf8String> {
-    pub fn read(&self) -> Result<String> {
+    pub async fn read(&self) -> Result<String> {
         let array = self.cast::<TArray<u8>>();
-        Ok(if let Some(chars) = array.data()? {
-            let chars = chars.read_vec(array.len()?)?;
+        Ok(if let Some(chars) = array.data().await? {
+            let chars = chars.read_vec(array.len().await?).await?;
             String::from_utf8(chars)?
         } else {
             "".to_string()
@@ -46,30 +46,33 @@ pub struct TArray<T, A: TAlloc = TSizedHeapAllocator<32>> {
     pub max: u32,
 }
 impl<T: Pod + Clone, A: TAlloc> Ptr<TArray<T, A>> {
-    pub fn iter(&self) -> Result<impl Iterator<Item = Ptr<T>> + '_> {
-        let data = self.data()?;
-        Ok((0..self.len()?).map(move |i| data.as_ref().unwrap().offset(i)))
+    /// Reads the backing pointer, then yields element `Ptr`s (no further reads).
+    pub async fn iter(&self) -> Result<impl Iterator<Item = Ptr<T>> + '_> {
+        let data = self.data().await?;
+        let len = self.len().await?;
+        Ok((0..len).map(move |i| data.as_ref().unwrap().offset(i)))
     }
 }
 impl<T, A: TAlloc> Ptr<TArray<T, A>> {
-    pub fn data(&self) -> Result<Option<Ptr<T>>> {
+    pub async fn data(&self) -> Result<Option<Ptr<T>>> {
         let alloc = self
             .byte_offset(std::mem::offset_of!(TArray<T, A>, data))
             .cast::<A::ForElementType<T>>();
 
-        <A as TAlloc>::ForElementType::<T>::data(&alloc)
+        <A as TAlloc>::ForElementType::<T>::data(&alloc).await
     }
-    pub fn len(&self) -> Result<usize> {
+    pub async fn len(&self) -> Result<usize> {
         Ok(self
             .byte_offset(std::mem::offset_of!(TArray<T, A>, num))
             .cast::<u32>()
-            .read()? as usize)
+            .read()
+            .await? as usize)
     }
 }
 impl<T: Pod, A: TAlloc> Ptr<TArray<T, A>> {
-    pub fn read_vec(&self) -> Result<Vec<T>> {
-        if let Some(data) = self.data()? {
-            data.read_vec(self.len()?)
+    pub async fn read_vec(&self) -> Result<Vec<T>> {
+        if let Some(data) = self.data().await? {
+            data.read_vec(self.len().await?).await
         } else {
             Ok(vec![])
         }
@@ -79,13 +82,15 @@ impl<T: Pod, A: TAlloc> Ptr<TArray<T, A>> {
 pub mod alloc {
     use super::*;
     use crate::mem::Ptr;
+    use async_trait::async_trait;
     use std::marker::PhantomData;
 
     pub trait TAlloc {
         type ForElementType<T>: TAllocImpl<T>;
     }
+    #[async_trait(?Send)]
     pub trait TAllocImpl<T> {
-        fn data(this: &Ptr<Self>) -> Result<Option<Ptr<T>>>
+        async fn data(this: &Ptr<Self>) -> Result<Option<Ptr<T>>>
         where
             Self: Sized;
     }
@@ -101,12 +106,13 @@ pub mod alloc {
         data: usize,
         _phantom: PhantomData<T>,
     }
+    #[async_trait(?Send)]
     impl<const N: usize, T> TAllocImpl<T> for THeapAlloc_ForElementType<N, T> {
-        fn data(this: &Ptr<Self>) -> Result<Option<Ptr<T>>>
+        async fn data(this: &Ptr<Self>) -> Result<Option<Ptr<T>>>
         where
             Self: Sized,
         {
-            this.cast::<Option<Ptr<T>>>().read()
+            this.cast::<Option<Ptr<T>>>().read().await
         }
     }
 }
@@ -132,10 +138,10 @@ impl Ptr<FName> {
         let offset = self.ctx().struct_member("FName", "Number");
         self.byte_offset(offset).cast()
     }
-    pub fn read(&self) -> Result<String> {
-        let number = self.number().read()?;
-        let comparison_index = self.comparison_index().value().read()?;
-        resolve_fname(self.ctx(), comparison_index, number)
+    pub async fn read(&self) -> Result<String> {
+        let number = self.number().read().await?;
+        let comparison_index = self.comparison_index().value().read().await?;
+        resolve_fname(self.ctx(), comparison_index, number).await
     }
 }
 
@@ -149,22 +155,24 @@ impl Ptr<FNameEntryAllocator> {
     }
 }
 
-pub fn resolve_fname(ctx: &Ctx, comparison_index: u32, number: u32) -> Result<String> {
+pub async fn resolve_fname(ctx: &Ctx, comparison_index: u32, number: u32) -> Result<String> {
     let fnamepool = ctx.fnamepool;
     let case_preserving = ctx.case_preserving;
 
     if ctx.ue_version() < (4, 22) {
-        let chunks = Ptr::<Ptr<Ptr<Ptr<()>>>>::new(fnamepool, ctx.clone())?.read()?;
+        let chunks = Ptr::<Ptr<Ptr<Ptr<()>>>>::new(fnamepool, ctx.clone())?
+            .read()
+            .await?;
 
         let per_chunk = 0x4000;
 
         let chunk = comparison_index / per_chunk;
         let offset = comparison_index % per_chunk;
 
-        let chunk = chunks.offset(chunk as usize).read()?;
-        let entry = chunk.offset(offset as usize).read()?;
+        let chunk = chunks.offset(chunk as usize).read().await?;
+        let entry = chunk.offset(offset as usize).read().await?;
 
-        let index = entry.cast::<u32>().read()?;
+        let index = entry.cast::<u32>().read().await?;
         let is_wide = (index & 1) == 1;
         let char_data = entry.byte_offset(0x10);
 
@@ -172,7 +180,7 @@ pub fn resolve_fname(ctx: &Ctx, comparison_index: u32, number: u32) -> Result<St
             let mut data = vec![];
             let char_data = char_data.cast::<u16>();
             for i in 0.. {
-                let next = char_data.offset(i).read()?;
+                let next = char_data.offset(i).read().await?;
                 if next == 0 {
                     break;
                 }
@@ -183,7 +191,7 @@ pub fn resolve_fname(ctx: &Ctx, comparison_index: u32, number: u32) -> Result<St
             let mut data = vec![];
             let char_data = char_data.cast::<u8>();
             for i in 0.. {
-                let next = char_data.offset(i).read()?;
+                let next = char_data.offset(i).read().await?;
                 if next == 0 {
                     break;
                 }
@@ -208,8 +216,8 @@ pub fn resolve_fname(ctx: &Ctx, comparison_index: u32, number: u32) -> Result<St
         (comparison_index & 0xffff) as usize * 2
     };
 
-    let block = blocks.offset(block_index).read()?;
-    let header = block.offset(offset).cast::<u16>().read()?;
+    let block = blocks.offset(block_index).read().await?;
+    let header = block.offset(offset).cast::<u16>().read().await?;
 
     let len = if case_preserving {
         (header >> 1) as usize
@@ -222,13 +230,14 @@ pub fn resolve_fname(ctx: &Ctx, comparison_index: u32, number: u32) -> Result<St
     let base = if is_wide {
         String::from_utf16(
             &data
-                .read_vec(len * 2)?
+                .read_vec(len * 2)
+                .await?
                 .chunks(2)
                 .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
                 .collect::<Vec<_>>(),
         )?
     } else {
-        String::from_utf8(data.read_vec(len)?)?
+        String::from_utf8(data.read_vec(len).await?)?
     };
     Ok(if number == 0 {
         base
@@ -237,7 +246,7 @@ pub fn resolve_fname(ctx: &Ctx, comparison_index: u32, number: u32) -> Result<St
     })
 }
 
-pub fn extract_fnames(ctx: &Ctx) -> Result<BTreeMap<u32, String>> {
+pub async fn extract_fnames(ctx: &Ctx) -> Result<BTreeMap<u32, String>> {
     let mut names = BTreeMap::new();
 
     let fname_pool_address = ctx.fnamepool;
@@ -251,7 +260,7 @@ pub fn extract_fnames(ctx: &Ctx) -> Result<BTreeMap<u32, String>> {
 
         let block_count = {
             let mut buf = [0u8; 4];
-            ctx.read_buf(fname_pool_address + 8, &mut buf)?;
+            ctx.read_buf(fname_pool_address + 8, &mut buf).await?;
             u32::from_le_bytes(buf) as usize
         };
 
@@ -261,12 +270,13 @@ pub fn extract_fnames(ctx: &Ctx) -> Result<BTreeMap<u32, String>> {
                 ctx.read_buf(
                     fname_pool_address + 0x10 + (block_index as u64) * 8,
                     &mut buf,
-                )?;
+                )
+                .await?;
                 u64::from_le_bytes(buf)
             };
 
             let mut chunk = vec![0u8; block_len];
-            if ctx.read_buf(block_ptr, &mut chunk).is_err() {
+            if ctx.read_buf(block_ptr, &mut chunk).await.is_err() {
                 continue;
             }
 
@@ -373,8 +383,8 @@ impl Ptr<FScriptBitArray> {
     }
 
     /// Check if a specific index is allocated (bit is set)
-    pub fn is_allocated(&self, index: usize) -> Result<bool> {
-        let num_bits = self.num_bits().read()?;
+    pub async fn is_allocated(&self, index: usize) -> Result<bool> {
+        let num_bits = self.num_bits().read().await?;
         if num_bits <= 0 || index >= num_bits as usize {
             return Ok(false);
         }
@@ -384,10 +394,10 @@ impl Ptr<FScriptBitArray> {
 
         // If secondary pointer is set, ALL data is on heap
         // Otherwise, ALL data is inline
-        let word = if let Some(secondary_ptr) = self.secondary_data().read()? {
-            secondary_ptr.offset(word_index).read()?
+        let word = if let Some(secondary_ptr) = self.secondary_data().read().await? {
+            secondary_ptr.offset(word_index).read().await?
         } else {
-            self.inline_data().offset(word_index).read()?
+            self.inline_data().offset(word_index).read().await?
         };
 
         Ok((word & (1 << bit_index)) != 0)
@@ -409,16 +419,16 @@ impl Ptr<FScriptSparseArray> {
         self.byte_offset(offset).cast()
     }
     /// Get the maximum index (Data.ArrayNum)
-    pub fn get_max_index(&self) -> Result<usize> {
-        Ok(self.data().num().read()? as usize)
+    pub async fn get_max_index(&self) -> Result<usize> {
+        Ok(self.data().num().read().await? as usize)
     }
     /// Check if an index is valid (allocated, not free)
-    pub fn is_valid_index(&self, index: usize) -> Result<bool> {
-        self.allocation_flags().is_allocated(index)
+    pub async fn is_valid_index(&self, index: usize) -> Result<bool> {
+        self.allocation_flags().is_allocated(index).await
     }
     /// Get pointer to element data at index (caller must know element size)
-    pub fn get_data(&self, index: usize, element_size: usize) -> Result<Ptr<u8>> {
-        let data_ptr = self.data().data().read()?.expect("sparse array data");
+    pub async fn get_data(&self, index: usize, element_size: usize) -> Result<Ptr<u8>> {
+        let data_ptr = self.data().data().read().await?.expect("sparse array data");
         Ok(data_ptr.byte_offset(index * element_size))
     }
 }

@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::mem::Ctx;
 use anyhow::Result;
+use futures_util::StreamExt;
 use jmap::{Address, ObjectType};
 
-pub fn analyze_vtables(
+pub async fn analyze_vtables(
     mem: &Ctx,
     objects: &mut BTreeMap<String, ObjectType>,
 ) -> BTreeMap<Address, Vec<Address>> {
@@ -30,51 +31,50 @@ pub fn analyze_vtables(
     //     println!("{i} {vtable:08x} {classes:?}");
     // }
 
-    fn read_ptr(mem: &Ctx, addr: u64) -> Result<u64> {
+    async fn read_ptr(mem: &Ctx, addr: u64) -> Result<u64> {
         let mut buf = [0; 8];
-        mem.read_buf(addr, &mut buf)?;
+        mem.read_buf(addr, &mut buf).await?;
         Ok(u64::from_le_bytes(buf))
     }
-    fn is_valid(mem: &Ctx, addr: u64) -> bool {
+    async fn is_valid(mem: &Ctx, addr: u64) -> bool {
         // TODO check for executable bit, not just valid memory
         let mut buf = [0; 1];
-        mem.read_buf(addr, &mut buf).is_ok()
+        mem.read_buf(addr, &mut buf).await.is_ok()
     }
 
     let mut vtables: BTreeMap<Address, Vec<Address>> = Default::default();
 
-    let mut vtable_iter = grouped.iter().peekable();
-    while let Some((vtable, _classes)) = vtable_iter.next() {
-        let next = vtable_iter.peek();
+    let entries: Vec<(Address, Option<Address>)> = {
+        let keys: Vec<Address> = grouped.keys().copied().collect();
+        (0..keys.len())
+            .map(|i| (keys[i], keys.get(i + 1).copied()))
+            .collect()
+    };
 
-        let mut addr = *vtable;
-        let mut funcs = vec![];
-
-        // println!("Searching {addr:08x}");
-
-        loop {
-            if next.is_some_and(|(ptr, _)| addr >= **ptr) {
-                // println!("BREAK NEXT n={}", funcs.len());
-                break;
-            }
-
-            if let Ok(ptr) = read_ptr(mem, addr.0) {
-                if is_valid(mem, ptr) {
-                    funcs.push(ptr.into());
-                } else {
-                    // println!("BREAK BAD FUNC PTR n={}", funcs.len());
+    let walks = futures_util::stream::iter(entries)
+        .map(|(vtable, bound)| async move {
+            let mut addr = vtable;
+            let mut funcs = vec![];
+            loop {
+                if bound.is_some_and(|ptr| addr >= ptr) {
                     break;
                 }
-            } else {
-                // println!("BREAK BAD READ n={}", funcs.len());
-                break;
+                // bad func ptr or unreadable: end of vtable (can't .await in a match guard, so check validity in the body)
+                let Ok(ptr) = read_ptr(mem, addr.0).await else {
+                    break;
+                };
+                if !is_valid(mem, ptr).await {
+                    break;
+                }
+                funcs.push(ptr.into());
+                addr.0 += 8;
             }
-            addr.0 += 8;
-        }
-        // println!("{classes:x?}");
-        // println!("{funcs:x?}");
-
-        assert!(vtables.insert(*vtable, funcs).is_none());
+            (vtable, funcs)
+        })
+        .buffer_unordered(crate::dump_concurrency());
+    let mut walks = std::pin::pin!(walks);
+    while let Some((vtable, funcs)) = walks.next().await {
+        assert!(vtables.insert(vtable, funcs).is_none());
     }
 
     // trim vtables as they must be bounded by size of child vtable

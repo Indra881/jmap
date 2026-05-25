@@ -14,12 +14,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use containers::{FName, FScriptMap, FScriptSet, FString};
+use futures_util::StreamExt;
 use jmap::{
     BytePropertyValue, Class, EClassCastFlags, EObjectFlags, EngineVersion, Enum,
     EnumPropertyValue, Function, Jmap, Metadata, Object, ObjectType, Package, Property,
     PropertyType, PropertyValue, ScriptStruct, Struct,
 };
-use mem::{Ctx, MemCache, ProcessHandle, Ptr};
+use mem::{BlockCache, Ctx, ProcessHandle, Ptr};
 use objects::FOptionalProperty;
 use ordermap::OrderMap;
 use patternsleuth::image::Image;
@@ -46,11 +47,11 @@ impl_collector! {
     }
 }
 
-fn read_path(obj: &Ptr<UObject>) -> Result<String> {
+async fn read_path(obj: &Ptr<UObject>) -> Result<String> {
     let mut objects = vec![obj.clone()];
 
     let mut obj = obj.clone();
-    while let Some(outer) = obj.outer_private().read()? {
+    while let Some(outer) = obj.outer_private().read().await? {
         objects.push(outer.clone());
         obj = outer;
     }
@@ -61,9 +62,11 @@ fn read_path(obj: &Ptr<UObject>) -> Result<String> {
         if let Some(prev) = prev {
             let sep = if prev
                 .class_private()
-                .read()?
+                .read()
+                .await?
                 .class_cast_flags()
-                .read()?
+                .read()
+                .await?
                 .contains(EClassCastFlags::CASTCLASS_UPackage)
             {
                 '.'
@@ -72,7 +75,7 @@ fn read_path(obj: &Ptr<UObject>) -> Result<String> {
             };
             path.push(sep);
         }
-        path.push_str(&obj.name_private().read()?);
+        path.push_str(&obj.name_private().read().await?);
         prev = Some(obj);
     }
 
@@ -150,8 +153,9 @@ pub fn open_minidump(path: impl AsRef<std::path::Path>) -> Result<OpenMinidump> 
     Ok(OpenMinidump { minidump, image })
 }
 
+#[async_trait::async_trait(?Send)]
 impl mem::Mem for MinidumpMem<'_> {
-    fn read_buf(&self, address: u64, buf: &mut [u8]) -> Result<()> {
+    async fn read_buf(&self, address: u64, buf: &mut [u8]) -> Result<()> {
         let mut bytes_read = 0;
         let total_bytes = buf.len();
         let read_end_address = address + total_bytes as u64;
@@ -229,20 +233,29 @@ pub fn dump(
     struct_info: Option<Structs>,
     options: DumpOptions,
 ) -> Result<Jmap> {
+    smol::block_on(dump_async(input, overrides, struct_info, options))
+}
+
+async fn dump_async(
+    input: Input,
+    overrides: ConfigOverrides,
+    struct_info: Option<Structs>,
+    options: DumpOptions,
+) -> Result<Jmap> {
     match input {
         Input::Process(pid) => {
             let source_name = proc_name::get_process_name(pid).unwrap_or_default();
 
             let handle: ProcessHandle = ProcessHandle::new(pid);
-            let mem = MemCache::wrap(handle);
+            let mem = BlockCache::wrap(handle);
             let ctx = match overrides.clone().into_complete() {
-                Some(config) => connect_manual(mem, config, struct_info, options.verbose)?,
+                Some(config) => connect_manual(mem, config, struct_info, options.verbose).await?,
                 None => {
                     let image = patternsleuth::process::external::read_image_from_pid(pid)?;
-                    connect(mem, &image, overrides, struct_info, options.verbose)?
+                    connect(mem, &image, overrides, struct_info, options.verbose).await?
                 }
             };
-            dump_inner(ctx, &source_name, options)
+            dump_inner(ctx, &source_name, options).await
         }
         Input::Dump(path) => {
             let source_name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -250,15 +263,15 @@ pub fn dump(
             let ctx = match overrides.clone().into_complete() {
                 Some(config) => {
                     let mem = MinidumpMem::new(load_minidump(&path)?)?;
-                    connect_manual(mem, config, struct_info, options.verbose)?
+                    connect_manual(mem, config, struct_info, options.verbose).await?
                 }
                 None => {
                     let dump = open_minidump(&path)?;
                     let mem = MinidumpMem::new(dump.minidump)?;
-                    connect(mem, &dump.image, overrides, struct_info, options.verbose)?
+                    connect(mem, &dump.image, overrides, struct_info, options.verbose).await?
                 }
             };
-            dump_inner(ctx, &source_name, options)
+            dump_inner(ctx, &source_name, options).await
         }
     }
 }
@@ -292,14 +305,14 @@ fn print_struct_layouts(structs: &Structs) {
     }
 }
 
-pub fn connect_pid(pid: i32, struct_info: Option<Structs>) -> Result<Ctx> {
+pub async fn connect_pid(pid: i32, struct_info: Option<Structs>) -> Result<Ctx> {
     let handle: ProcessHandle = ProcessHandle::new(pid);
-    let mem = MemCache::wrap(handle);
+    let mem = BlockCache::wrap(handle);
     let image = patternsleuth::process::external::read_image_from_pid(pid)?;
-    connect(mem, &image, ConfigOverrides::default(), struct_info, false)
+    connect(mem, &image, ConfigOverrides::default(), struct_info, false).await
 }
 
-pub fn connect_pid_live(pid: i32, struct_info: Option<Structs>) -> Result<Ctx> {
+pub async fn connect_pid_live(pid: i32, struct_info: Option<Structs>) -> Result<Ctx> {
     let handle: ProcessHandle = ProcessHandle::new(pid);
     let image = patternsleuth::process::external::read_image_from_pid(pid)?;
     connect(
@@ -309,6 +322,7 @@ pub fn connect_pid_live(pid: i32, struct_info: Option<Structs>) -> Result<Ctx> {
         struct_info,
         false,
     )
+    .await
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -354,7 +368,13 @@ impl ConfigOverrides {
     }
 }
 
-pub fn resolve_config(
+async fn read_u32<M: mem::Mem + ?Sized>(mem: &M, addr: u64) -> Result<u32> {
+    let mut buf = [0u8; 4];
+    mem.read_buf(addr, &mut buf).await?;
+    Ok(u32::from_le_bytes(buf))
+}
+
+pub async fn resolve_config(
     mem: &impl mem::Mem,
     image: &Image<'_>,
     overrides: &ConfigOverrides,
@@ -403,7 +423,7 @@ pub fn resolve_config(
 
     let case_preserving = match overrides.case_preserving {
         Some(cp) => cp,
-        None => detect_case_preserving(mem, &results, engine_version)?,
+        None => detect_case_preserving(mem, &results, engine_version).await?,
     };
 
     Ok(Config {
@@ -422,7 +442,7 @@ pub fn resolve_config(
     })
 }
 
-fn detect_case_preserving(
+async fn detect_case_preserving(
     mem: &impl mem::Mem,
     results: &Resolution,
     version: (u16, u16),
@@ -431,33 +451,28 @@ fn detect_case_preserving(
         return Ok(false);
     };
     let name_constant_address = fname_constant.0;
-    let read_u32 = |addr: u64| -> Result<u32> {
-        let mut buf = [0u8; 4];
-        mem.read_buf(addr, &mut buf)?;
-        Ok(u32::from_le_bytes(buf))
-    };
 
     // Field offsets mirror the FName layout in jmap_dumper/unreal/src/unreal.gs:
     //         UE <  4.23: [CMP, NUM]
     // 4.23 <= UE <  5.01: [CMP, DISP?, NUM]   (DISP only when case-preserving)
     //         UE >= 5.01: [CMP, NUM, DISP?]
-    let comparison_index = read_u32(name_constant_address)?;
+    let comparison_index = read_u32(mem, name_constant_address).await?;
     assert_ne!(comparison_index, 0);
 
     let (case_preserving_detected, number_off) = if version < (4, 23) {
         (false, 4)
     } else if version < (5, 1) {
-        if read_u32(name_constant_address + 4)? == comparison_index {
+        if read_u32(mem, name_constant_address + 4).await? == comparison_index {
             (true, 8)
         } else {
             (false, 4)
         }
     } else {
-        let cp = read_u32(name_constant_address + 8)? == comparison_index;
+        let cp = read_u32(mem, name_constant_address + 8).await? == comparison_index;
         (cp, 4)
     };
 
-    let number = read_u32(name_constant_address + number_off)?;
+    let number = read_u32(mem, name_constant_address + number_off).await?;
     assert_eq!(
         number, 0,
         "Builds with outlined name number (UE_FNAME_OUTLINE_NUMBER=1) are not supported"
@@ -465,18 +480,18 @@ fn detect_case_preserving(
     Ok(case_preserving_detected)
 }
 
-pub fn connect(
+pub async fn connect(
     mem: impl mem::Mem + 'static,
     image: &Image<'_>,
     overrides: ConfigOverrides,
     struct_info: Option<Structs>,
     verbose: bool,
 ) -> Result<Ctx> {
-    let config = resolve_config(&mem, image, &overrides)?;
-    connect_manual(mem, config, struct_info, verbose)
+    let config = resolve_config(&mem, image, &overrides).await?;
+    connect_manual(mem, config, struct_info, verbose).await
 }
 
-pub fn connect_manual(
+pub async fn connect_manual(
     mem: impl mem::Mem + 'static,
     config: Config,
     struct_info: Option<Structs>,
@@ -565,42 +580,58 @@ fn has_canonical_cdo(class_path: &str, obj: &ObjectType) -> bool {
     c.class_default_object.as_deref() == Some(expected.as_str())
 }
 
-fn dump_inner(mem: Ctx, source_name: &str, options: DumpOptions) -> Result<Jmap> {
+/// Number of object dumps to keep in flight at once
+fn dump_concurrency() -> usize {
+    std::env::var("JMAP_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(1024)
+}
+
+async fn dump_one(
+    uobjectarray: &Ptr<FUObjectArray>,
+    i: usize,
+    num: usize,
+    options: &DumpOptions,
+) -> Result<Option<(String, ObjectType)>> {
+    let Some(obj) = uobjectarray.read_item_ptr(i).await? else {
+        return Ok(None);
+    };
+
+    let path = obj.path().await?;
+
+    if options.verbose {
+        eprintln!("[{i}/{num}] {path}");
+    }
+
+    Ok(read_object_type(obj, &path, options)
+        .await?
+        .map(|object| (path, object)))
+}
+
+async fn dump_inner(mem: Ctx, source_name: &str, options: DumpOptions) -> Result<Jmap> {
     let uobjectarray = Ptr::<FUObjectArray>::new(mem.uobjectarray, mem.clone())?;
 
     let mut objects = BTreeMap::<String, ObjectType>::default();
     let mut child_map = HashMap::<String, BTreeSet<String>>::default();
 
-    for i in 0..uobjectarray.num_elements()? {
-        let object = uobjectarray.read_item_ptr(i as usize)?;
-        let Some(obj) = object else {
-            continue;
-        };
+    let num = uobjectarray.num_elements().await? as usize;
 
-        let path = obj.path()?;
+    // keep many object dumps in flight
+    let mut stream = futures_util::stream::iter(0..num)
+        .map(|i| dump_one(&uobjectarray, i, num, &options))
+        .buffer_unordered(dump_concurrency());
 
-        let obj = read_object_type(obj, &path, &options);
-        // let obj = match obj {
-        //     Err(err) => {
-        //         eprintln!("{i}: {path} Failed to read: {err}");
-        //         continue;
-        //     }
-        //     r => r,
-        // };
-
-        let Some(object) = obj? else {
-            continue;
-        };
-
-        // println!("{i} {path}");
-
-        // update child_map
-        if let Some(outer) = object.get_object().outer.clone() {
-            child_map.entry(outer).or_default().insert(path.clone());
+    while let Some(result) = stream.next().await {
+        if let Some((path, object)) = result? {
+            if let Some(outer) = object.get_object().outer.clone() {
+                child_map.entry(outer).or_default().insert(path.clone());
+            }
+            insert_object(&mut objects, path, object);
         }
-
-        insert_object(&mut objects, path, object);
     }
+    drop(stream);
 
     for (outer, children) in child_map {
         if let Some(outer) = objects.get_mut(&outer) {
@@ -616,10 +647,10 @@ fn dump_inner(mem: Ctx, source_name: &str, options: DumpOptions) -> Result<Jmap>
         }
     }
 
-    let vtables = vtable::analyze_vtables(&mem, &mut objects);
+    let vtables = vtable::analyze_vtables(&mem, &mut objects).await;
 
     let names = if options.names {
-        Some(extract_fnames(&mem)?)
+        Some(extract_fnames(&mem).await?)
     } else {
         None
     };
@@ -642,54 +673,74 @@ fn dump_inner(mem: Ctx, source_name: &str, options: DumpOptions) -> Result<Jmap>
     })
 }
 
-pub fn read_object_type(
+pub async fn read_object_type(
     obj: Ptr<UObject>,
     path: &str,
     options: &DumpOptions,
 ) -> Result<Option<ObjectType>> {
-    let class = obj.class_private().read()?;
+    let class = obj.class_private().read().await?;
 
     if !options.all && !path.starts_with("/Script/") {
         return Ok(None);
     }
-    let object_flags = obj.object_flags().read()?;
+    let object_flags = obj.object_flags().read().await?;
     let is_basic_object = object_flags.contains(EObjectFlags::RF_ArchetypeObject)
         || object_flags.contains(EObjectFlags::RF_ClassDefaultObject);
 
-    let f = class.class_cast_flags().read()?;
+    let f = class.class_cast_flags().read().await?;
     let object = if !is_basic_object && f.contains(EClassCastFlags::CASTCLASS_UClass) {
-        ObjectType::Class(read_class(&obj.cast())?)
+        ObjectType::Class(read_class(&obj.cast()).await?)
     } else if !is_basic_object && f.contains(EClassCastFlags::CASTCLASS_UFunction) {
         let full_obj = obj.cast::<UFunction>();
-        let function_flags = full_obj.function_flags().read()?;
+        let function_flags = full_obj.function_flags().read().await?;
         ObjectType::Function(Function {
-            r#struct: read_struct(&obj.cast())?,
+            r#struct: read_struct(&obj.cast()).await?,
             function_flags,
-            func: (full_obj.func().read()? as u64).into(),
+            func: (full_obj.func().read().await? as u64).into(),
         })
     } else if !is_basic_object && f.contains(EClassCastFlags::CASTCLASS_UScriptStruct) {
-        ObjectType::ScriptStruct(read_script_struct(&obj.cast())?)
+        ObjectType::ScriptStruct(read_script_struct(&obj.cast()).await?)
     } else if !is_basic_object && f.contains(EClassCastFlags::CASTCLASS_UEnum) {
-        ObjectType::Enum(read_enum(&obj.cast())?)
+        ObjectType::Enum(read_enum(&obj.cast()).await?)
     } else if !is_basic_object && f.contains(EClassCastFlags::CASTCLASS_UPackage) {
         ObjectType::Package(Package {
-            object: read_object(&obj)?,
+            object: read_object(&obj).await?,
         })
     } else {
         let obj = obj.cast::<UObject>();
-        ObjectType::Object(read_object(&obj)?)
-        //println!("{path:?} {:?}", f);
+        ObjectType::Object(read_object(&obj).await?)
     };
     Ok(Some(object))
 }
 
-pub fn read_prop_type(ptr: &Ptr<ZProperty>) -> Result<Property> {
-    let name = ptr.zfield().name_private().read()?;
-    let f = ptr.zfield().cast_flags()?;
+async fn opt_path<T>(opt: Option<Ptr<T>>) -> Result<Option<String>>
+where
+    Ptr<T>: HasPath,
+{
+    Ok(match opt {
+        Some(p) => Some(p.path().await?),
+        None => None,
+    })
+}
+
+#[allow(async_fn_in_trait)]
+pub trait HasPath {
+    async fn path(&self) -> Result<String>;
+}
+macro_rules! has_path {
+    ($($t:ty),* $(,)?) => { $( impl HasPath for Ptr<$t> {
+        async fn path(&self) -> Result<String> { Ptr::<$t>::path(self).await }
+    } )* };
+}
+has_path!(UObject, UClass, UStruct, UScriptStruct, UFunction, UEnum);
+
+pub async fn read_prop_type(ptr: &Ptr<ZProperty>) -> Result<Property> {
+    let name = ptr.zfield().name_private().read().await?;
+    let f = ptr.zfield().cast_flags().await?;
 
     let t = if f.contains(EClassCastFlags::CASTCLASS_FStructProperty) {
         let prop = ptr.cast::<ZStructProperty>();
-        let s = prop.struct_().read()?.path()?;
+        let s = prop.struct_().read().await?.path().await?;
         PropertyType::Struct { r#struct: s }
     } else if f.contains(EClassCastFlags::CASTCLASS_FStrProperty) {
         PropertyType::Str
@@ -699,65 +750,59 @@ pub fn read_prop_type(ptr: &Ptr<ZProperty>) -> Result<Property> {
         PropertyType::Text
     } else if f.contains(EClassCastFlags::CASTCLASS_FMulticastInlineDelegateProperty) {
         let prop = ptr.cast::<ZMulticastDelegateProperty>();
-        let signature_function = prop
-            .signature_function()
-            .read()?
-            .map(|e| e.path())
-            .transpose()?;
+        let signature_function = opt_path(prop.signature_function().read().await?).await?;
         PropertyType::MulticastInlineDelegate { signature_function }
     } else if f.contains(EClassCastFlags::CASTCLASS_FMulticastSparseDelegateProperty) {
         let prop = ptr.cast::<ZMulticastDelegateProperty>();
-        let signature_function = prop
-            .signature_function()
-            .read()?
-            .map(|e| e.path())
-            .transpose()?;
+        let signature_function = opt_path(prop.signature_function().read().await?).await?;
         PropertyType::MulticastSparseDelegate { signature_function }
     } else if f.contains(EClassCastFlags::CASTCLASS_FMulticastDelegateProperty) {
         let prop = ptr.cast::<ZMulticastDelegateProperty>();
-        let signature_function = prop
-            .signature_function()
-            .read()?
-            .map(|e| e.path())
-            .transpose()?;
+        let signature_function = opt_path(prop.signature_function().read().await?).await?;
         PropertyType::MulticastDelegate { signature_function }
     } else if f.contains(EClassCastFlags::CASTCLASS_FDelegateProperty) {
         let prop = ptr.cast::<ZDelegateProperty>();
-        let signature_function = prop
-            .signature_function()
-            .read()?
-            .map(|e| e.path())
-            .transpose()?;
+        let signature_function = opt_path(prop.signature_function().read().await?).await?;
         PropertyType::Delegate { signature_function }
     } else if f.contains(EClassCastFlags::CASTCLASS_FBoolProperty) {
         let prop = ptr.cast::<ZBoolProperty>();
         PropertyType::Bool {
-            field_size: prop.field_size().read()?,
-            byte_offset: prop.byte_offset_().read()?,
-            byte_mask: prop.byte_mask().read()?,
-            field_mask: prop.field_mask().read()?,
+            field_size: prop.field_size().read().await?,
+            byte_offset: prop.byte_offset_().read().await?,
+            byte_mask: prop.byte_mask().read().await?,
+            field_mask: prop.field_mask().read().await?,
         }
     } else if f.contains(EClassCastFlags::CASTCLASS_FArrayProperty) {
         let prop = ptr.cast::<ZArrayProperty>();
         PropertyType::Array {
-            inner: read_prop_type(&prop.inner().read()?.cast())?.into(),
+            inner: Box::pin(read_prop_type(&prop.inner().read().await?.cast()))
+                .await?
+                .into(),
         }
     } else if f.contains(EClassCastFlags::CASTCLASS_FEnumProperty) {
         let prop = ptr.cast::<ZEnumProperty>();
         PropertyType::Enum {
-            container: read_prop_type(&prop.underlying_prop().read()?.cast())?.into(),
-            r#enum: prop.enum_().read()?.map(|e| e.path()).transpose()?,
+            container: Box::pin(read_prop_type(&prop.underlying_prop().read().await?.cast()))
+                .await?
+                .into(),
+            r#enum: opt_path(prop.enum_().read().await?).await?,
         }
     } else if f.contains(EClassCastFlags::CASTCLASS_FMapProperty) {
         let prop = ptr.cast::<ZMapProperty>();
         PropertyType::Map {
-            key_prop: read_prop_type(&prop.key_prop().read()?.cast())?.into(),
-            value_prop: read_prop_type(&prop.value_prop().read()?.cast())?.into(),
+            key_prop: Box::pin(read_prop_type(&prop.key_prop().read().await?.cast()))
+                .await?
+                .into(),
+            value_prop: Box::pin(read_prop_type(&prop.value_prop().read().await?.cast()))
+                .await?
+                .into(),
         }
     } else if f.contains(EClassCastFlags::CASTCLASS_FSetProperty) {
         let prop = ptr.cast::<ZSetProperty>();
         PropertyType::Set {
-            key_prop: read_prop_type(&prop.element_prop().read()?.cast())?.into(),
+            key_prop: Box::pin(read_prop_type(&prop.element_prop().read().await?.cast()))
+                .await?
+                .into(),
         }
     } else if f.contains(EClassCastFlags::CASTCLASS_FFloatProperty) {
         PropertyType::Float
@@ -766,7 +811,7 @@ pub fn read_prop_type(ptr: &Ptr<ZProperty>) -> Result<Property> {
     } else if f.contains(EClassCastFlags::CASTCLASS_FByteProperty) {
         let prop = ptr.cast::<ZByteProperty>();
         PropertyType::Byte {
-            r#enum: prop.enum_().read()?.map(|e| e.path()).transpose()?,
+            r#enum: opt_path(prop.enum_().read().await?).await?,
         }
     } else if f.contains(EClassCastFlags::CASTCLASS_FUInt16Property) {
         PropertyType::UInt16
@@ -784,43 +829,51 @@ pub fn read_prop_type(ptr: &Ptr<ZProperty>) -> Result<Property> {
         PropertyType::Int64
     } else if f.contains(EClassCastFlags::CASTCLASS_FClassProperty) {
         let prop = ptr.cast::<ZClassProperty>();
-        let property_class = prop.fobject_property().property_class().read()?.path()?;
-        let meta_class = prop.meta_class().read()?.path()?;
+        let property_class = prop
+            .fobject_property()
+            .property_class()
+            .read()
+            .await?
+            .path()
+            .await?;
+        let meta_class = prop.meta_class().read().await?.path().await?;
         PropertyType::Class {
             property_class,
             meta_class,
         }
     } else if f.contains(EClassCastFlags::CASTCLASS_FObjectProperty) {
         let prop = ptr.cast::<ZObjectProperty>();
-        let property_class = prop.property_class().read()?.path()?;
+        let property_class = prop.property_class().read().await?.path().await?;
         PropertyType::Object { property_class }
     } else if f.contains(EClassCastFlags::CASTCLASS_FSoftClassProperty) {
         let prop = ptr.cast::<ZSoftClassProperty>();
         let property_class = prop
             .fsoft_object_property()
             .property_class()
-            .read()?
-            .path()?;
-        let meta_class = prop.meta_class().read()?.path()?;
+            .read()
+            .await?
+            .path()
+            .await?;
+        let meta_class = prop.meta_class().read().await?.path().await?;
         PropertyType::SoftClass {
             property_class,
             meta_class,
         }
     } else if f.contains(EClassCastFlags::CASTCLASS_FSoftObjectProperty) {
         let prop = ptr.cast::<ZSoftObjectProperty>();
-        let property_class = prop.property_class().read()?.path()?;
+        let property_class = prop.property_class().read().await?.path().await?;
         PropertyType::SoftObject { property_class }
     } else if f.contains(EClassCastFlags::CASTCLASS_FWeakObjectProperty) {
         let prop = ptr.cast::<ZWeakObjectProperty>();
-        let c = prop.property_class().read()?.path()?;
+        let c = prop.property_class().read().await?.path().await?;
         PropertyType::WeakObject { property_class: c }
     } else if f.contains(EClassCastFlags::CASTCLASS_FLazyObjectProperty) {
         let prop = ptr.cast::<ZLazyObjectProperty>();
-        let c = prop.property_class().read()?.path()?;
+        let c = prop.property_class().read().await?.path().await?;
         PropertyType::LazyObject { property_class: c }
     } else if f.contains(EClassCastFlags::CASTCLASS_FInterfaceProperty) {
         let prop = ptr.cast::<ZInterfaceProperty>();
-        let interface_class = prop.interface_class().read()?.path()?;
+        let interface_class = prop.interface_class().read().await?.path().await?;
         PropertyType::Interface { interface_class }
     } else if f.contains(EClassCastFlags::CASTCLASS_FFieldPathProperty) {
         // TODO
@@ -828,7 +881,9 @@ pub fn read_prop_type(ptr: &Ptr<ZProperty>) -> Result<Property> {
     } else if f.contains(EClassCastFlags::CASTCLASS_FOptionalProperty) {
         let prop = ptr.cast::<FOptionalProperty>();
         PropertyType::Optional {
-            inner: read_prop_type(&prop.value_property().read()?.cast())?.into(),
+            inner: Box::pin(read_prop_type(&prop.value_property().read().await?.cast()))
+                .await?
+                .into(),
         }
     } else if f.contains(EClassCastFlags::CASTCLASS_FUtf8StrProperty) {
         PropertyType::Utf8Str
@@ -842,32 +897,33 @@ pub fn read_prop_type(ptr: &Ptr<ZProperty>) -> Result<Property> {
     Ok(Property {
         address: ptr.address().into(),
         name,
-        offset: prop.offset_internal().read()? as usize,
-        array_dim: prop.array_dim().read()? as usize,
-        size: prop.element_size().read()? as usize,
-        flags: prop.property_flags().read()?,
+        offset: prop.offset_internal().read().await? as usize,
+        array_dim: prop.array_dim().read().await? as usize,
+        size: prop.element_size().read().await? as usize,
+        flags: prop.property_flags().read().await?,
         r#type: t,
     })
 }
 
-pub fn read_props(
+pub async fn read_props(
     ustruct: &Ptr<UStruct>,
     ptr: &Ptr<()>,
 ) -> Result<OrderMap<String, PropertyValue>> {
     let mut properties = OrderMap::new();
-    for prop in ustruct.properties(true) {
+    let mut props = ustruct.properties(true);
+    while let Some(prop) = props.next().await {
         let prop = prop?;
-        let array_dim = prop.array_dim().read()? as usize;
-        let name = prop.zfield().name_private().read()?;
+        let array_dim = prop.array_dim().read().await? as usize;
+        let name = prop.zfield().name_private().read().await?;
         if array_dim == 1 {
-            if let Some(value) = read_prop(&prop, ptr, 0)? {
+            if let Some(value) = Box::pin(read_prop(&prop, ptr, 0)).await? {
                 properties.insert(name, value);
             }
         } else {
             let mut elements = vec![];
             let mut success = true;
             for i in 0..array_dim {
-                if let Some(value) = read_prop(&prop, ptr, i)? {
+                if let Some(value) = Box::pin(read_prop(&prop, ptr, i)).await? {
                     elements.push(value);
                 } else {
                     success = false;
@@ -881,22 +937,24 @@ pub fn read_props(
     Ok(properties)
 }
 
-pub fn read_prop(
+pub async fn read_prop(
     prop: &Ptr<ZProperty>,
     ptr: &Ptr<()>,
     index: usize,
 ) -> Result<Option<PropertyValue>> {
-    let size = prop.element_size().read()? as usize;
-    let ptr = ptr.byte_offset(prop.offset_internal().read()? as usize + index * size);
-    let f = prop.zfield().cast_flags()?;
+    let size = prop.element_size().read().await? as usize;
+    let ptr = ptr.byte_offset(prop.offset_internal().read().await? as usize + index * size);
+    let f = prop.zfield().cast_flags().await?;
 
     let value = if f.contains(EClassCastFlags::CASTCLASS_FStructProperty) {
         let prop = prop.cast::<ZStructProperty>();
-        PropertyValue::Struct(read_props(&prop.struct_().read()?.ustruct(), &ptr)?)
+        PropertyValue::Struct(
+            Box::pin(read_props(&prop.struct_().read().await?.ustruct(), &ptr)).await?,
+        )
     } else if f.contains(EClassCastFlags::CASTCLASS_FStrProperty) {
-        PropertyValue::Str(ptr.cast::<FString>().read()?)
+        PropertyValue::Str(ptr.cast::<FString>().read().await?)
     } else if f.contains(EClassCastFlags::CASTCLASS_FNameProperty) {
-        PropertyValue::Name(ptr.cast::<FName>().read()?)
+        PropertyValue::Name(ptr.cast::<FName>().read().await?)
     } else if f.contains(EClassCastFlags::CASTCLASS_FTextProperty) {
         return Ok(None);
     } else if f.contains(EClassCastFlags::CASTCLASS_FMulticastInlineDelegateProperty) {
@@ -909,20 +967,24 @@ pub fn read_prop(
         return Ok(None);
     } else if f.contains(EClassCastFlags::CASTCLASS_FBoolProperty) {
         let prop = prop.cast::<ZBoolProperty>();
-        let byte_offset = prop.byte_offset_().read()?;
-        let byte_mask = prop.byte_mask().read()?;
-        let byte = ptr.byte_offset(byte_offset as usize).cast::<u8>().read()?;
+        let byte_offset = prop.byte_offset_().read().await?;
+        let byte_mask = prop.byte_mask().read().await?;
+        let byte = ptr
+            .byte_offset(byte_offset as usize)
+            .cast::<u8>()
+            .read()
+            .await?;
         PropertyValue::Bool(byte & byte_mask != 0)
     } else if f.contains(EClassCastFlags::CASTCLASS_FArrayProperty) {
         let prop = prop.cast::<ZArrayProperty>();
         let array = ptr.cast::<FScriptArray>();
 
-        let num = array.num().read()? as usize;
+        let num = array.num().read().await? as usize;
         let mut data = Vec::with_capacity(num);
-        if let Some(data_ptr) = array.data().read()? {
-            let inner_prop = prop.inner().read()?;
+        if let Some(data_ptr) = array.data().read().await? {
+            let inner_prop = prop.inner().read().await?;
             for i in 0..num {
-                let value = read_prop(&inner_prop, &data_ptr, i)?;
+                let value = Box::pin(read_prop(&inner_prop, &data_ptr, i)).await?;
                 if let Some(value) = value {
                     data.push(value);
                 } else {
@@ -934,8 +996,9 @@ pub fn read_prop(
         PropertyValue::Array(data)
     } else if f.contains(EClassCastFlags::CASTCLASS_FEnumProperty) {
         let prop = prop.cast::<ZEnumProperty>();
-        let underlying =
-            read_prop(&prop.underlying_prop().read()?, &ptr, 0)?.expect("valid underlying prop");
+        let underlying = Box::pin(read_prop(&prop.underlying_prop().read().await?, &ptr, 0))
+            .await?
+            .expect("valid underlying prop");
         let value = match underlying {
             PropertyValue::Byte(BytePropertyValue::Value(v)) => v as i64,
             PropertyValue::Int8(v) => v as i64,
@@ -947,7 +1010,9 @@ pub fn read_prop(
             PropertyValue::UInt64(v) => v as i64,
             e => bail!("underlying enum prop {e:?}"),
         };
-        let names = read_enum(&prop.enum_().read()?.expect("valid enum"))?.names;
+        let names = read_enum(&prop.enum_().read().await?.expect("valid enum"))
+            .await?
+            .names;
         let name = names
             .into_iter()
             .find_map(|(name, v)| (v == value).then_some(name));
@@ -961,23 +1026,23 @@ pub fn read_prop(
         let prop = prop.cast::<ZMapProperty>();
         let map = ptr.cast::<FScriptMap>();
 
-        let key_prop = prop.key_prop().read()?;
-        let value_prop = prop.value_prop().read()?;
+        let key_prop = prop.key_prop().read().await?;
+        let value_prop = prop.value_prop().read().await?;
 
         let map_layout = prop.map_layout();
-        let pair_wrapper_size = map_layout.set_layout().size().read()? as usize;
+        let pair_wrapper_size = map_layout.set_layout().size().read().await? as usize;
 
         let mut entries = BTreeMap::new();
 
         let sparse_array = map.pairs().elements();
-        let max_index = sparse_array.get_max_index()?;
+        let max_index = sparse_array.get_max_index().await?;
 
         for i in 0..max_index {
-            if sparse_array.is_valid_index(i)? {
-                let pair_ptr = sparse_array.get_data(i, pair_wrapper_size)?;
+            if sparse_array.is_valid_index(i).await? {
+                let pair_ptr = sparse_array.get_data(i, pair_wrapper_size).await?;
 
-                let key = read_prop(&key_prop, &pair_ptr.cast(), 0)?;
-                let value = read_prop(&value_prop, &pair_ptr.cast(), 0)?;
+                let key = Box::pin(read_prop(&key_prop, &pair_ptr.cast(), 0)).await?;
+                let value = Box::pin(read_prop(&value_prop, &pair_ptr.cast(), 0)).await?;
 
                 if let (Some(k), Some(v)) = (key, value) {
                     entries.insert(k, v);
@@ -990,19 +1055,21 @@ pub fn read_prop(
         let prop = prop.cast::<ZSetProperty>();
         let set = ptr.cast::<FScriptSet>();
 
-        let element_prop = prop.element_prop().read()?;
+        let element_prop = prop.element_prop().read().await?;
 
-        let element_wrapper_size = prop.set_layout().size().read()? as usize;
+        let element_wrapper_size = prop.set_layout().size().read().await? as usize;
 
         let mut elements = BTreeSet::new();
 
         let sparse_array = set.elements();
-        let max_index = sparse_array.get_max_index()?;
+        let max_index = sparse_array.get_max_index().await?;
 
         for i in 0..max_index {
-            if sparse_array.is_valid_index(i)? {
-                let element_ptr = sparse_array.get_data(i, element_wrapper_size)?;
-                if let Some(value) = read_prop(&element_prop, &element_ptr.cast(), 0)? {
+            if sparse_array.is_valid_index(i).await? {
+                let element_ptr = sparse_array.get_data(i, element_wrapper_size).await?;
+                if let Some(value) =
+                    Box::pin(read_prop(&element_prop, &element_ptr.cast(), 0)).await?
+                {
                     elements.insert(value);
                 }
             }
@@ -1010,49 +1077,43 @@ pub fn read_prop(
 
         PropertyValue::Set(elements)
     } else if f.contains(EClassCastFlags::CASTCLASS_FFloatProperty) {
-        PropertyValue::Float(ptr.cast::<f32>().read()?.into())
+        PropertyValue::Float(ptr.cast::<f32>().read().await?.into())
     } else if f.contains(EClassCastFlags::CASTCLASS_FDoubleProperty) {
-        PropertyValue::Double(ptr.cast::<f64>().read()?.into())
+        PropertyValue::Double(ptr.cast::<f64>().read().await?.into())
     } else if f.contains(EClassCastFlags::CASTCLASS_FByteProperty) {
         let prop = prop.cast::<ZByteProperty>();
-        let value = ptr.cast::<u8>().read()?;
+        let value = ptr.cast::<u8>().read().await?;
+        let enum_names = match prop.enum_().read().await? {
+            Some(e) => Some(read_enum(&e).await?),
+            None => None,
+        };
         PropertyValue::Byte(
-            if let Some(name) = prop
-                .enum_()
-                .read()?
-                .map(|e| read_enum(&e))
-                .transpose()?
-                .and_then(|e| {
-                    e.names
-                        .into_iter()
-                        .find_map(|(name, v)| (v == value as i64).then_some(name))
-                })
-            {
+            if let Some(name) = enum_names.and_then(|e| {
+                e.names
+                    .into_iter()
+                    .find_map(|(name, v)| (v == value as i64).then_some(name))
+            }) {
                 BytePropertyValue::Name(name)
             } else {
                 BytePropertyValue::Value(value)
             },
         )
     } else if f.contains(EClassCastFlags::CASTCLASS_FUInt16Property) {
-        PropertyValue::UInt16(ptr.cast::<u16>().read()?)
+        PropertyValue::UInt16(ptr.cast::<u16>().read().await?)
     } else if f.contains(EClassCastFlags::CASTCLASS_FUInt32Property) {
-        PropertyValue::UInt32(ptr.cast::<u32>().read()?)
+        PropertyValue::UInt32(ptr.cast::<u32>().read().await?)
     } else if f.contains(EClassCastFlags::CASTCLASS_FUInt64Property) {
-        PropertyValue::UInt64(ptr.cast::<u64>().read()?)
+        PropertyValue::UInt64(ptr.cast::<u64>().read().await?)
     } else if f.contains(EClassCastFlags::CASTCLASS_FInt8Property) {
-        PropertyValue::Int8(ptr.cast::<i8>().read()?)
+        PropertyValue::Int8(ptr.cast::<i8>().read().await?)
     } else if f.contains(EClassCastFlags::CASTCLASS_FInt16Property) {
-        PropertyValue::Int16(ptr.cast::<i16>().read()?)
+        PropertyValue::Int16(ptr.cast::<i16>().read().await?)
     } else if f.contains(EClassCastFlags::CASTCLASS_FIntProperty) {
-        PropertyValue::Int(ptr.cast::<i32>().read()?)
+        PropertyValue::Int(ptr.cast::<i32>().read().await?)
     } else if f.contains(EClassCastFlags::CASTCLASS_FInt64Property) {
-        PropertyValue::Int64(ptr.cast::<i64>().read()?)
+        PropertyValue::Int64(ptr.cast::<i64>().read().await?)
     } else if f.contains(EClassCastFlags::CASTCLASS_FObjectProperty) {
-        let obj = ptr
-            .cast::<Option<Ptr<UObject>>>()
-            .read()?
-            .map(|e| e.path())
-            .transpose()?;
+        let obj = opt_path(ptr.cast::<Option<Ptr<UObject>>>().read().await?).await?;
         PropertyValue::Object(obj)
     } else if f.contains(EClassCastFlags::CASTCLASS_FWeakObjectProperty) {
         return Ok(None);
@@ -1067,71 +1128,68 @@ pub fn read_prop(
     } else if f.contains(EClassCastFlags::CASTCLASS_FOptionalProperty) {
         return Ok(None);
     } else if f.contains(EClassCastFlags::CASTCLASS_FUtf8StrProperty) {
-        PropertyValue::Utf8Str(ptr.cast::<FUtf8String>().read()?)
+        PropertyValue::Utf8Str(ptr.cast::<FUtf8String>().read().await?)
     } else if f.contains(EClassCastFlags::CASTCLASS_FAnsiStrProperty) {
         // technically needs to be C locale but probably never going to encounter non-ASCII characters anyway
-        PropertyValue::Utf8Str(ptr.cast::<FUtf8String>().read()?)
+        PropertyValue::Utf8Str(ptr.cast::<FUtf8String>().read().await?)
     } else {
         unimplemented!("{f:?}");
     };
     Ok(Some(value))
 }
 
-pub fn read_object(obj: &Ptr<UObject>) -> Result<Object> {
-    let outer = obj.outer_private().read()?.map(|s| s.path()).transpose()?;
+pub async fn read_object(obj: &Ptr<UObject>) -> Result<Object> {
+    let outer = opt_path(obj.outer_private().read().await?).await?;
 
-    let class = obj.class_private().read()?;
-    let class_name = class.path()?;
+    let class = obj.class_private().read().await?;
+    let class_name = class.path().await?;
 
     Ok(Object {
         address: obj.address().into(),
-        vtable: (obj.vtable().read()? as u64).into(),
-        object_flags: obj.object_flags().read()?,
+        vtable: (obj.vtable().read().await? as u64).into(),
+        object_flags: obj.object_flags().read().await?,
         outer,
         class: class_name,
         children: Default::default(),
-        property_values: read_props(&class.ustruct(), &obj.cast())?.into(),
+        property_values: read_props(&class.ustruct(), &obj.cast()).await?.into(),
     })
 }
 
-pub fn read_struct(obj: &Ptr<UStruct>) -> Result<Struct> {
+pub async fn read_struct(obj: &Ptr<UStruct>) -> Result<Struct> {
     let mut properties = vec![];
-    for prop in obj.properties(false) {
+    let mut props = obj.properties(false);
+    while let Some(prop) = props.next().await {
         let prop = prop?;
-        let f = prop.zfield().cast_flags()?;
+        let f = prop.zfield().cast_flags().await?;
         if f.contains(EClassCastFlags::CASTCLASS_FProperty) {
-            properties.push(read_prop_type(&prop.cast::<ZProperty>())?);
+            properties.push(read_prop_type(&prop.cast::<ZProperty>()).await?);
         }
     }
 
-    let super_struct = obj.super_struct().read()?.map(|s| s.path()).transpose()?;
+    let super_struct = opt_path(obj.super_struct().read().await?).await?;
     Ok(Struct {
-        object: read_object(&obj.cast())?,
+        object: read_object(&obj.cast()).await?,
         super_struct,
         properties,
-        properties_size: obj.properties_size().read()? as usize,
-        min_alignment: obj.min_alignment().read()? as usize,
-        script: obj.script().read_vec()?,
+        properties_size: obj.properties_size().read().await? as usize,
+        min_alignment: obj.min_alignment().read().await? as usize,
+        script: obj.script().read_vec().await?,
     })
 }
 
-pub fn read_script_struct(obj: &Ptr<UScriptStruct>) -> Result<ScriptStruct> {
+pub async fn read_script_struct(obj: &Ptr<UScriptStruct>) -> Result<ScriptStruct> {
     Ok(ScriptStruct {
-        r#struct: read_struct(&obj.ustruct())?,
-        struct_flags: obj.struct_flags().read()?,
+        r#struct: read_struct(&obj.ustruct()).await?,
+        struct_flags: obj.struct_flags().read().await?,
     })
 }
 
-pub fn read_class(obj: &Ptr<UClass>) -> Result<Class> {
-    let class_flags = obj.class_flags().read()?;
-    let class_cast_flags = obj.class_cast_flags().read()?;
-    let class_default_object = obj
-        .class_default_object()
-        .read()?
-        .map(|s| s.path())
-        .transpose()?;
+pub async fn read_class(obj: &Ptr<UClass>) -> Result<Class> {
+    let class_flags = obj.class_flags().read().await?;
+    let class_cast_flags = obj.class_cast_flags().read().await?;
+    let class_default_object = opt_path(obj.class_default_object().read().await?).await?;
     Ok(Class {
-        r#struct: read_struct(&obj.cast())?,
+        r#struct: read_struct(&obj.cast()).await?,
         class_flags,
         class_cast_flags,
         class_default_object,
@@ -1139,14 +1197,17 @@ pub fn read_class(obj: &Ptr<UClass>) -> Result<Class> {
     })
 }
 
-pub fn read_enum(obj: &Ptr<UEnum>) -> Result<Enum> {
+pub async fn read_enum(obj: &Ptr<UEnum>) -> Result<Enum> {
+    let enum_flags = if obj.ctx().ue_version() >= (4, 26) {
+        Some(obj.enum_flags().read().await?)
+    } else {
+        None
+    };
     Ok(Enum {
-        object: read_object(&obj.cast())?,
-        cpp_type: obj.cpp_type().read()?,
-        cpp_form: obj.cpp_form().read()?,
-        enum_flags: (obj.ctx().ue_version() >= (4, 26))
-            .then(|| obj.enum_flags().read())
-            .transpose()?,
-        names: obj.read_names()?,
+        object: read_object(&obj.cast()).await?,
+        cpp_type: obj.cpp_type().read().await?,
+        cpp_form: obj.cpp_form().read().await?,
+        enum_flags,
+        names: obj.read_names().await?,
     })
 }
