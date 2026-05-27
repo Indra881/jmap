@@ -73,6 +73,19 @@ pub trait Mem {
     fn clear_cache(&self) {}
 }
 
+#[async_trait(?Send)]
+impl Mem for Box<dyn Mem> {
+    async fn read_buf(&self, address: u64, buf: &mut [u8]) -> Result<()> {
+        (**self).read_buf(address, buf).await
+    }
+    async fn write_buf(&self, address: u64, buf: &[u8]) -> Result<()> {
+        (**self).write_buf(address, buf).await
+    }
+    fn clear_cache(&self) {
+        (**self).clear_cache()
+    }
+}
+
 const BLOCK_SIZE: u64 = 0x10000;
 
 pub struct BlockCache<M> {

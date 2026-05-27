@@ -340,66 +340,103 @@ pub fn dump(
     smol::block_on(dump_async(input, overrides, struct_info, options))
 }
 
+pub struct Source {
+    pub mem: Box<dyn mem::Mem>,
+    pub config: Config,
+    pub name: String,
+}
+
 async fn dump_async(
     input: Input,
     overrides: ConfigOverrides,
     struct_info: Option<Structs>,
     options: DumpOptions,
 ) -> Result<Jmap> {
+    let Source { mem, config, name } = open_source(input, overrides).await?;
+    let ctx = connect_manual(mem, config, struct_info, options.verbose).await?;
+    dump_inner(ctx, &name, options).await
+}
+
+async fn open_source(input: Input, overrides: ConfigOverrides) -> Result<Source> {
     match input {
-        Input::Process(pid) => {
-            let source_name = proc_name::get_process_name(pid).unwrap_or_default();
-
-            let handle: ProcessHandle = ProcessHandle::new(pid);
-            let mem = BlockCache::wrap(handle);
-            let ctx = match overrides.clone().into_complete() {
-                Some(config) => connect_manual(mem, config, struct_info, options.verbose).await?,
-                None => {
-                    let image = patternsleuth::process::external::read_image_from_pid(pid)?;
-                    connect(mem, &image, overrides, struct_info, options.verbose).await?
-                }
-            };
-            dump_inner(ctx, &source_name, options).await
-        }
-        Input::Dump(path) => {
-            let source_name = path.file_name().unwrap_or_default().to_string_lossy();
-
-            let ctx = match overrides.clone().into_complete() {
-                Some(config) => {
-                    let mem = MinidumpMem::new(load_minidump(&path)?)?;
-                    connect_manual(mem, config, struct_info, options.verbose).await?
-                }
-                None => {
-                    let dump = open_minidump(&path)?;
-                    let mem = MinidumpMem::new(dump.minidump)?;
-                    connect(mem, &dump.image, overrides, struct_info, options.verbose).await?
-                }
-            };
-            dump_inner(ctx, &source_name, options).await
-        }
-        Input::ConcatDump(path) => {
-            let config = overrides.into_complete().context(
-                "concat dumps require manual config (--fname-pool, --guobject-array, --engine-version)",
-            )?;
-            let source_name = path.file_name().unwrap_or_default().to_string_lossy();
-            let mem = ConcatMem::open(&path)?;
-            let ctx = connect_manual(mem, config, struct_info, options.verbose).await?;
-            dump_inner(ctx, &source_name, options).await
-        }
-        Input::MachoCore(path) => {
-            let mut overrides = overrides;
-            overrides
-                .target_triplet
-                .get_or_insert_with(structs::macos_target_triplet);
-            let config = overrides.into_complete().context(
-                "Mach-O cores require manual config (--fname-pool, --guobject-array, --engine-version)",
-            )?;
-            let source_name = path.file_name().unwrap_or_default().to_string_lossy();
-            let mem = BlockCache::wrap(MachoCoreMem::open(&path)?);
-            let ctx = connect_manual(mem, config, struct_info, options.verbose).await?;
-            dump_inner(ctx, &source_name, options).await
-        }
+        Input::Process(pid) => open_process(pid, overrides).await,
+        Input::Dump(path) => open_dump(path, overrides).await,
+        Input::ConcatDump(path) => open_concat(path, overrides).await,
+        Input::MachoCore(path) => open_macho(path, overrides).await,
     }
+}
+
+async fn open_process(pid: i32, overrides: ConfigOverrides) -> Result<Source> {
+    let name = proc_name::get_process_name(pid).unwrap_or_default();
+    let mem = BlockCache::wrap(ProcessHandle::new(pid));
+    // Manual config skips patternsleuth entirely; otherwise probe the live image.
+    let config = match overrides.clone().into_complete() {
+        Some(config) => config,
+        None => {
+            let image = patternsleuth::process::external::read_image_from_pid(pid)?;
+            resolve_config(&mem, &image, &overrides).await?
+        }
+    };
+    Ok(Source {
+        mem: Box::new(mem),
+        config,
+        name,
+    })
+}
+
+async fn open_dump(path: PathBuf, overrides: ConfigOverrides) -> Result<Source> {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let (mem, config): (Box<dyn mem::Mem>, Config) = match overrides.clone().into_complete() {
+        Some(config) => (Box::new(MinidumpMem::new(load_minidump(&path)?)?), config),
+        None => {
+            let dump = open_minidump(&path)?;
+            let mem = MinidumpMem::new(dump.minidump)?;
+            let config = resolve_config(&mem, &dump.image, &overrides).await?;
+            (Box::new(mem), config)
+        }
+    };
+    Ok(Source { mem, config, name })
+}
+
+async fn open_concat(path: PathBuf, overrides: ConfigOverrides) -> Result<Source> {
+    let config = overrides.into_complete().context(
+        "concat dumps require manual config (--fname-pool, --guobject-array, --engine-version)",
+    )?;
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let mem = ConcatMem::open(&path)?;
+    Ok(Source {
+        mem: Box::new(mem),
+        config,
+        name,
+    })
+}
+
+async fn open_macho(path: PathBuf, mut overrides: ConfigOverrides) -> Result<Source> {
+    overrides
+        .target_triplet
+        .get_or_insert_with(structs::macos_target_triplet);
+    let config = overrides.into_complete().context(
+        "Mach-O cores require manual config (--fname-pool, --guobject-array, --engine-version)",
+    )?;
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let mem = BlockCache::wrap(MachoCoreMem::open(&path)?);
+    Ok(Source {
+        mem: Box::new(mem),
+        config,
+        name,
+    })
 }
 
 use script_containers::*;
