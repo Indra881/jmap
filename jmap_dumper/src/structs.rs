@@ -131,6 +131,7 @@ pub fn get_struct_info_for_version(
         ("unreal", "FNameEntryAllocator"),
         ("properties", "FField"),
         ("properties", "FFieldClass"),
+        ("properties", "FFieldVariant"),
     ];
 
     let mounted_container = vm_state.mount_container(container)?;

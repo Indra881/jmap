@@ -423,6 +423,62 @@ impl Ptr<ZField> {
             class.read().await?.cast_flags().read().await
         }
     }
+    pub async fn owner(&self) -> Result<Option<FieldOwner>> {
+        if self.ctx().ue_version() < (4, 25) {
+            let Some(outer) = self.cast::<UObject>().outer_private().read().await? else {
+                return Ok(None);
+            };
+            let is_prop = outer
+                .cast::<ZField>()
+                .cast_flags()
+                .await?
+                .contains(EClassCastFlags::CASTCLASS_FProperty);
+            return Ok(Some(if is_prop {
+                FieldOwner::Field(outer.cast())
+            } else {
+                FieldOwner::Object(outer)
+            }));
+        }
+
+        let owner_off = self.ctx().struct_member("FField", "Owner");
+        let variant: Ptr<FFieldVariant> = self.byte_offset(owner_off).cast();
+        variant.read().await
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct FFieldVariant;
+impl Ptr<FFieldVariant> {
+    pub fn container(&self) -> Ptr<u64> {
+        let offset = self.ctx().struct_member("FFieldVariant", "Container");
+        self.byte_offset(offset).cast()
+    }
+    pub fn is_uobject(&self) -> Ptr<bool> {
+        let offset = self.ctx().struct_member("FFieldVariant", "bIsUObject");
+        self.byte_offset(offset).cast()
+    }
+    pub async fn read(&self) -> Result<Option<FieldOwner>> {
+        let container = self.container().read().await?;
+        if container == 0 {
+            return Ok(None);
+        }
+        let ctx = self.ctx().clone();
+        let (is_uobject, ptr) = if self.ctx().ue_version() >= (5, 3) {
+            (container & 0x1 != 0, container & !0x1)
+        } else {
+            (self.is_uobject().read().await?, container)
+        };
+        Ok(Some(if is_uobject {
+            FieldOwner::Object(Ptr::<UObject>::new(ptr, ctx)?)
+        } else {
+            FieldOwner::Field(Ptr::<ZField>::new(ptr, ctx)?)
+        }))
+    }
+}
+
+pub enum FieldOwner {
+    Object(Ptr<UObject>),
+    Field(Ptr<ZField>),
 }
 
 #[derive(Clone, Copy)]

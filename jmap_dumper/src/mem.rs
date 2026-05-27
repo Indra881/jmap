@@ -53,6 +53,12 @@ impl_pod_bitflags!(
     (EEnumFlags, u8),
 );
 
+impl Pod for bool {
+    fn try_from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(bytemuck::pod_read_unaligned::<u8>(bytes) != 0)
+    }
+}
+
 impl Pod for ECppForm {
     fn try_from_bytes(bytes: &[u8]) -> Result<Self> {
         let discriminant: u8 = bytemuck::pod_read_unaligned(bytes);
