@@ -153,6 +153,34 @@ pub fn open_minidump(path: impl AsRef<std::path::Path>) -> Result<OpenMinidump> 
     Ok(OpenMinidump { minidump, image })
 }
 
+/// Infer the struct-layout target triple from a minidump's SystemInfo stream.
+pub fn target_triplet_from_minidump(
+    minidump: &minidump::Minidump<'_, &[u8]>,
+) -> Option<structs::TargetTriplet> {
+    use gospel_typelib::target_triplet::{
+        TargetArchitecture, TargetEnvironment, TargetOperatingSystem,
+    };
+    use minidump::system_info::{Cpu, Os};
+
+    let info = minidump.get_stream::<minidump::MinidumpSystemInfo>().ok()?;
+    let arch = match info.cpu {
+        Cpu::X86_64 => TargetArchitecture::X86_64,
+        Cpu::Arm64 => TargetArchitecture::ARM64,
+        _ => return None,
+    };
+    let (sys, env) = match info.os {
+        Os::Windows => (TargetOperatingSystem::Win32, Some(TargetEnvironment::MSVC)),
+        Os::Android => (
+            TargetOperatingSystem::Linux,
+            Some(TargetEnvironment::Android),
+        ),
+        Os::Linux => (TargetOperatingSystem::Linux, Some(TargetEnvironment::Gnu)),
+        Os::MacOs | Os::Ios => (TargetOperatingSystem::Darwin, None),
+        _ => return None,
+    };
+    Some(structs::TargetTriplet { arch, sys, env })
+}
+
 #[async_trait::async_trait(?Send)]
 impl mem::Mem for MinidumpMem<'_> {
     async fn read_buf(&self, address: u64, buf: &mut [u8]) -> Result<()> {
@@ -384,18 +412,46 @@ async fn open_process(pid: i32, overrides: ConfigOverrides) -> Result<Source> {
     })
 }
 
-async fn open_dump(path: PathBuf, overrides: ConfigOverrides) -> Result<Source> {
+async fn open_dump(path: PathBuf, mut overrides: ConfigOverrides) -> Result<Source> {
     let name = path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
+    let minidump = load_minidump(&path)?;
+
+    if overrides.target_triplet.is_none() {
+        if let Some(inferred) = target_triplet_from_minidump(minidump) {
+            eprintln!("inferred target {inferred:?} from minidump SystemInfo");
+            overrides.target_triplet = Some(inferred);
+        }
+    }
+
     let (mem, config): (Box<dyn mem::Mem>, Config) = match overrides.clone().into_complete() {
-        Some(config) => (Box::new(MinidumpMem::new(load_minidump(&path)?)?), config),
+        Some(config) => (Box::new(MinidumpMem::new(minidump)?), config),
         None => {
-            let dump = open_minidump(&path)?;
-            let mem = MinidumpMem::new(dump.minidump)?;
-            let config = resolve_config(&mem, &dump.image, &overrides).await?;
+            use gospel_typelib::target_triplet::{
+                TargetArchitecture, TargetEnvironment, TargetOperatingSystem,
+            };
+            let target = overrides
+                .target_triplet
+                .unwrap_or_else(structs::default_target_triplet);
+            if target
+                != (structs::TargetTriplet {
+                    arch: TargetArchitecture::X86_64,
+                    sys: TargetOperatingSystem::Win32,
+                    env: Some(TargetEnvironment::MSVC),
+                })
+            {
+                bail!(
+                    "automatic resolution only supports win64 (x86_64-pc-windows-msvc); \
+                     target {target:?} requires manual config \
+                     (--fname-pool, --guobject-array, --engine-version)"
+                );
+            }
+            let image = patternsleuth::image::pe::read_image_from_minidump(minidump)?;
+            let mem = MinidumpMem::new(minidump)?;
+            let config = resolve_config(&mem, &image, &overrides).await?;
             (Box::new(mem), config)
         }
     };
