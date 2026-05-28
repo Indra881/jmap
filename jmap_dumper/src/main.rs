@@ -41,6 +41,12 @@ struct Cli {
     #[arg(long, value_parser = parse_hex_u64, value_name = "HEX")]
     image_base: Option<u64>,
 
+    /// Resolve --fname-pool/--guobject-array as RVA offsets from this module's
+    /// load address (minidump input only). Matches on the module basename, e.g.
+    /// libUnreal.so. Also defaults --image-base to the module base.
+    #[arg(long, value_name = "NAME")]
+    module: Option<String>,
+
     /// Build changelist string
     #[arg(long)]
     build_changelist: Option<String>,
@@ -136,6 +142,7 @@ fn main() -> Result<()> {
         // Presence forces packing on; absence leaves the default (off).
         pack_fuobject_item: cli.pack_fuobject_item.then_some(true),
         target_triplet: cli.target,
+        module: cli.module.clone(),
     };
 
     let reflection_data: Jmap = if let Some(path) = cli.jmap {

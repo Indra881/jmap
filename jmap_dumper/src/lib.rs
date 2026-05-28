@@ -153,6 +153,41 @@ pub fn open_minidump(path: impl AsRef<std::path::Path>) -> Result<OpenMinidump> 
     Ok(OpenMinidump { minidump, image })
 }
 
+/// Resolve a loaded module's base address from a minidump by name.
+pub fn module_base_from_minidump(
+    minidump: &minidump::Minidump<'_, &[u8]>,
+    name: &str,
+) -> Result<u64> {
+    use minidump::Module;
+
+    let list = minidump
+        .get_stream::<minidump::MinidumpModuleList>()
+        .context("No module list in minidump")?;
+
+    let basename =
+        |path: &str| -> String { path.rsplit(['/', '\\']).next().unwrap_or(path).to_owned() };
+
+    let mut matches = list.iter().filter(|m| {
+        let code = m.code_file();
+        code.as_ref() == name || basename(&code).eq_ignore_ascii_case(name)
+    });
+
+    let first = matches.next().ok_or_else(|| {
+        let available = list
+            .iter()
+            .map(|m| basename(&m.code_file()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::anyhow!("no module matching {name:?} in minidump; available modules: {available}")
+    })?;
+
+    if matches.next().is_some() {
+        bail!("multiple modules match {name:?} in minidump; pass a more specific name");
+    }
+
+    Ok(first.base_address())
+}
+
 /// Infer the struct-layout target triple from a minidump's SystemInfo stream.
 pub fn target_triplet_from_minidump(
     minidump: &minidump::Minidump<'_, &[u8]>,
@@ -316,6 +351,18 @@ async fn open_dump(path: PathBuf, mut overrides: ConfigOverrides) -> Result<Sour
         .into_owned();
     let minidump = load_minidump(&path)?;
 
+    if let Some(module) = overrides.module.clone() {
+        let base = module_base_from_minidump(minidump, &module)?;
+        eprintln!("resolved module {module:?} to load address 0x{base:x}");
+        if let Some(off) = overrides.fname_pool.as_mut() {
+            *off += base;
+        }
+        if let Some(off) = overrides.guobject_array.as_mut() {
+            *off += base;
+        }
+        overrides.image_base.get_or_insert(base);
+    }
+
     if overrides.target_triplet.is_none() {
         if let Some(inferred) = target_triplet_from_minidump(minidump) {
             eprintln!("inferred target {inferred:?} from minidump SystemInfo");
@@ -451,6 +498,8 @@ pub struct ConfigOverrides {
     pub pack_fuobject_item: Option<bool>,
     /// Target triple: `None` defaults to win64 MSVC
     pub target_triplet: Option<structs::TargetTriplet>,
+    /// Module name to resolve `fname_pool`/`guobject_array` as RVA offsets against
+    pub module: Option<String>,
 }
 
 impl ConfigOverrides {
