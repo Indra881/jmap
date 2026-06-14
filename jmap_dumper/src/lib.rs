@@ -1047,11 +1047,12 @@ pub async fn read_prop_type(ptr: &Ptr<ZProperty>) -> Result<Property> {
     };
 
     let prop = ptr.cast::<ZProperty>();
+    let array_dim = prop.array_dim().read().await?.max(0) as usize;
     Ok(Property {
         address: ptr.address().into(),
         name,
         offset: prop.offset_internal().read().await? as usize,
-        array_dim: prop.array_dim().read().await? as usize,
+        array_dim,
         size: prop.element_size().read().await? as usize,
         flags: prop.property_flags().read().await?,
         r#type: t,

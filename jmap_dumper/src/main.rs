@@ -252,8 +252,8 @@ fn into_usmap(reflection_data: &Jmap) -> usmap::Usmap {
 fn into_usmap_prop(index: usize, prop: &jmap::Property) -> usmap::Property {
     usmap::Property {
         name: prop.name.clone(),
-        array_dim: prop.array_dim.try_into().unwrap(),
-        index: index.try_into().unwrap(),
+        array_dim: prop.array_dim.try_into().unwrap_or(255),
+        index: index.try_into().unwrap_or(u16::MAX),
         inner: into_usmap_prop_inner(&prop.r#type),
     }
 }
