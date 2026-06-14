@@ -1,5 +1,5 @@
 [workspace]
-members = ["cargo:."]
+members = ["cargo:jmap_dumper", "cargo:jmap", "cargo:usmap", "cargo:ue_binja"]
 
 # Config for 'dist'
 [dist]
@@ -10,8 +10,8 @@ ci = "github"
 # The installers to generate for each app
 installers = []
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
-# Whether to consider the binaries in a package for distribution (defaults true)
-dist = false
+targets = ["x86_64-pc-windows-msvc"]
+# Enable distribution
+dist = true
 # Allow manual edits to CI files
 allow-dirty = ["ci"]
