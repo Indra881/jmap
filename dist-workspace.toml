@@ -13,3 +13,5 @@ installers = []
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Whether to consider the binaries in a package for distribution (defaults true)
 dist = false
+# Allow manual edits to CI files
+allow-dirty = ["ci"]
